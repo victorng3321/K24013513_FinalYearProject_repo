@@ -1,0 +1,548 @@
+```{r}
+source("config.R")
+```
+
+
+#### !!!!! NOTE THIS PART WAS CONDUCTED ON LOCAL TERMINAL ####
+
+# CHUNK 1: Libraries
+```{r setup, message = FALSE, warning = FALSE}
+library(IsoformSwitchAnalyzeR)
+library(rtracklayer)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+options(stringsAsFactors = FALSE)
+```
+
+
+# CHUNK 2: Paths and configuration
+```{r paths}
+QUANT_DIR  <- file.path(DIR_SALMON, "quants")
+CLIN_FILE  <- file.path(DIR_QC, "DEA_samples_QCmetrics.tsv")
+GTF_FILE   <- file.path(DIR_REFS, "gencode.v49.annotation.gtf.gz")
+FASTA_FILE <- file.path(DIR_REFS, "gencode.v49.transcripts.fa.gz")
+OUT_DIR    <- file.path(RESULTS, "isoform_qc98")   # QC-98 sensitivity run (was DIR_ISOFORM)
+dir.create(OUT_DIR, showWarnings = FALSE)
+cat("Outputs will land in:", OUT_DIR, "\n")
+```
+
+
+# CHUNK 3: Gene panels
+```{r gene-panels}
+# Original candidates
+ORIGINAL <- c("SIGLEC9", "ESR1", "PGR", "ERBB2")
+
+# Hallmark breast-cancer drivers
+HALLMARK_DRIVERS <- c(
+  "BRCA1","BRCA2","TP53","PIK3CA","ERBB2","ESR1","GATA3","MAP3K1",
+  "CDH1","PTEN","AKT1","KRAS","SF3B1","CBFB","CDKN1B","RUNX1",
+  "NF1","ATM","CHEK2","AR")
+
+# Frequently mutated / CNV drivers
+FREQ_MUTATED <- c(
+  "MYC","CCND1","FGFR1","ZNF703","FOXA1","TBX3","MLLT4",
+  "GPS2","MAGI3","MAP2K4","NCOR1","SMAD4","ARID1A","KMT2C","KMT2D",
+  "NOTCH1","NOTCH2","RB1")
+
+# Receptor family for ratio and stratified analysis
+RECEPTOR_FAMILY <- c("ESR1","ESR2","PGR","ERBB2","AR")
+
+EXTENDED_PANEL <- unique(c(ORIGINAL, HALLMARK_DRIVERS, FREQ_MUTATED, RECEPTOR_FAMILY))
+cat("Extended panel:", length(EXTENDED_PANEL), "unique genes\n")
+
+# Standard column subset for reporting
+cols <- c("gene_name","isoform_id","IF1","IF2","dIF",
+          "isoform_switch_q_value","gene_switch_q_value",
+          "gene_value_1","gene_value_2","iso_value_1","iso_value_2")
+```
+
+# CHUNK 4: Clinical metadata > design matrix
+```{r design}
+clin <- read.table(CLIN_FILE, header = TRUE, sep = "\t",
+                   na.strings = c("NA","N/A","999","","#N/A"),
+                   comment.char = "", quote = "\"")
+clin_filt <- clin[clin$tissue_pathology == "primary DCIS" &
+                  clin$case_control %in% c("case","control") &
+                  (is.na(clin$final_qc) | clin$final_qc != "fail"), ]   # QC-98 subset
+stopifnot(nrow(clin_filt) == 98)   # guard: must be the 98 QC-passing samples
+myDesign <- data.frame(
+  sampleID  = clin_filt$sample_id,
+  condition = ifelse(clin_filt$case_control == "case",
+                     "progressor", "non_progressor"))
+cat("Design:", sum(myDesign$condition == "progressor"), "progressors,",
+    sum(myDesign$condition == "non_progressor"), "non-progressors\n")
+
+comparisonsToMake <- data.frame(condition_1 = "non_progressor",
+                                condition_2 = "progressor")
+```
+
+
+# CHUNK 5: Import Salmon quantifications
+```{r salmon-import}
+salmonQuant <- importIsoformExpression(
+  parentDir            = QUANT_DIR,
+  addIsofomIdAsColumn  = TRUE,
+  ignoreAfterBar       = TRUE,
+  ignoreAfterSpace     = TRUE,
+  ignoreAfterPeriod    = FALSE,
+  showProgress         = TRUE)
+cat("Imported", ncol(salmonQuant$counts) - 1, "samples,",
+    nrow(salmonQuant$counts), "transcripts\n")
+
+# Match design to available Salmon samples
+salmon_samples <- colnames(salmonQuant$counts)[-1]
+myDesign <- myDesign[myDesign$sampleID %in% salmon_samples, ]
+cat("Matched samples:", nrow(myDesign), "\n")
+```
+
+# CHUNK 6: Filter to GENCODE-annotated transcripts
+```{r filter-annotated}
+gtf <- rtracklayer::import(GTF_FILE)
+annot_ids <- unique(gtf$transcript_id[!is.na(gtf$transcript_id)])
+cat("Annotated transcripts in GTF:", length(annot_ids), "\n")
+
+keep_rows <- salmonQuant$counts$isoform_id %in% annot_ids
+cat("Keeping", sum(keep_rows), "of", nrow(salmonQuant$counts), "transcripts\n")
+salmonQuant$counts    <- salmonQuant$counts[keep_rows, ]
+salmonQuant$abundance <- salmonQuant$abundance[keep_rows, ]
+```
+
+
+# CHUNK 7: Build switchAnalyzeRlist
+```{r build-switchlist}
+switchList <- importRdata(
+  isoformCountMatrix   = salmonQuant$counts,
+  isoformRepExpression = salmonQuant$abundance,
+  designMatrix         = myDesign,
+  isoformExonAnnoation = GTF_FILE,
+  isoformNtFasta       = FASTA_FILE,
+  comparisonsToMake    = comparisonsToMake,
+  removeNonConvensionalChr = TRUE,
+  showProgress         = TRUE)
+cat("switchAnalyzeRlist built:",
+    length(unique(switchList$isoformFeatures$gene_id)), "genes,",
+    length(unique(switchList$isoformFeatures$isoform_id)), "isoforms\n")
+```
+
+
+# CHUNK 8: Pre-filter
+```{r prefilter}
+switchListFiltered <- preFilter(
+  switchAnalyzeRlist       = switchList,
+  geneExpressionCutoff     = 1,
+  isoformExpressionCutoff  = 0,
+  IFcutoff                 = 0.01,
+  removeSingleIsoformGenes = TRUE,
+  quiet                    = FALSE)
+cat("After filter:",
+    length(unique(switchListFiltered$isoformFeatures$gene_id)), "genes,",
+    length(unique(switchListFiltered$isoformFeatures$isoform_id)), "isoforms\n")
+```
+
+
+# CHUNK 9: satuRn test (full cohort)
+```{r saturn-test}
+switchListAnalyzed <- isoformSwitchTestSatuRn(
+  switchAnalyzeRlist     = switchListFiltered,
+  alpha                  = 0.05,
+  dIFcutoff              = 0.1,
+  reduceToSwitchingGenes = FALSE)
+
+saveRDS(switchListAnalyzed, file.path(INTERMEDIATE, "switchListAnalyzed_qc98.rds"))
+cat("Saved switchListAnalyzed to", OUT_DIR, "\n")
+```
+
+
+# CHUNK 10: Global summary (whole cohort)
+```{r global-summary}
+# Gene-level helpers wrapped so an empty result (possible at n=98) doesn't abort the run
+tryCatch(print(extractSwitchSummary(switchListAnalyzed)),
+         error = function(e) cat("extractSwitchSummary:", conditionMessage(e), "\n"))
+
+topSwitches <- tryCatch(
+  extractTopSwitches(switchListAnalyzed, filterForConsequences = FALSE,
+                     n = 30, sortByQvals = TRUE),
+  error = function(e) { cat("extractTopSwitches:", conditionMessage(e), "\n"); NULL })
+if (!is.null(topSwitches)) {
+  print(topSwitches)
+  write.csv(topSwitches, file.path(OUT_DIR, "top_switches_whole_cohort.csv"),
+            row.names = FALSE)
+}
+
+results <- switchListAnalyzed$isoformFeatures
+sig_results <- results[!is.na(results$isoform_switch_q_value) &
+                       results$isoform_switch_q_value < 0.05 &
+                       abs(results$dIF) > 0.10, ]
+write.csv(results,     file.path(OUT_DIR, "results_all_isoforms.csv"),     row.names = FALSE)
+write.csv(sig_results, file.path(OUT_DIR, "significant_switches.csv"),     row.names = FALSE)
+cat("Significant switches:", nrow(sig_results), "\n")
+```
+
+
+# CHUNK 11: Extended panel — whole-cohort results
+```{r extended-panel}
+panel_results <- results[results$gene_name %in% EXTENDED_PANEL, cols]
+panel_results <- panel_results[order(panel_results$gene_name,
+                                     -abs(panel_results$dIF)), ]
+write.csv(panel_results, file.path(OUT_DIR, "extended_panel_all_cohort.csv"),
+          row.names = FALSE)
+
+panel_sig <- panel_results[!is.na(panel_results$isoform_switch_q_value) &
+                           panel_results$isoform_switch_q_value < 0.05 &
+                           abs(panel_results$dIF) > 0.10, ]
+cat("=== Extended panel: significant switches (whole cohort) ===\n")
+print(panel_sig)
+```
+
+
+# CHUNK 12: ESR1 / ESR2 ratio + ESR2 vs ER status
+```{r esr1-esr2}
+tpm_mat   <- switchListAnalyzed$isoformRepExpression
+gene_feat <- switchListAnalyzed$isoformFeatures
+esr1_iso  <- unique(gene_feat$isoform_id[gene_feat$gene_name == "ESR1"])
+esr2_iso  <- unique(gene_feat$isoform_id[gene_feat$gene_name == "ESR2"])
+cat("ESR1 isoforms passing filter:", length(esr1_iso), "\n")
+cat("ESR2 isoforms passing filter:", length(esr2_iso), "\n")
+
+if (length(esr1_iso) > 0 && length(esr2_iso) > 0) {
+  esr1_total <- colSums(tpm_mat[rownames(tpm_mat) %in% esr1_iso, , drop = FALSE])
+  esr2_total <- colSums(tpm_mat[rownames(tpm_mat) %in% esr2_iso, , drop = FALSE])
+
+  ratio_df <- data.frame(
+    sampleID     = names(esr1_total),
+    ESR1_TPM     = as.numeric(esr1_total),
+    ESR2_TPM     = as.numeric(esr2_total),
+    ESR1_to_ESR2 = as.numeric(esr1_total) / pmax(as.numeric(esr2_total), 0.01))
+  ratio_df <- merge(ratio_df, myDesign, by = "sampleID")
+  ratio_df$ER_status <- clin$er[match(ratio_df$sampleID, clin$sample_id)]
+
+  cat("\nESR2 TPM by ER status:\n")
+  print(aggregate(ESR2_TPM ~ ER_status, data = ratio_df,
+                  FUN = function(x) c(mean = round(mean(x), 3),
+                                      sd   = round(sd(x), 3),
+                                      n    = length(x))))
+
+  esr2_test <- t.test(ESR2_TPM ~ as.numeric(ER_status), data = ratio_df)
+  cat("ESR2 t-test ER+ vs ER-: t =", round(esr2_test$statistic, 2),
+      ", p =", signif(esr2_test$p.value, 3), "\n")
+
+  cat("\nESR1/ESR2 ratio by progression:\n")
+  print(aggregate(ESR1_to_ESR2 ~ condition, data = ratio_df,
+                  FUN = function(x) round(c(mean = mean(x),
+                                            median = median(x)), 2)))
+
+  p1 <- ggplot(ratio_df, aes(x = factor(ER_status), y = log2(ESR2_TPM + 1))) +
+    geom_boxplot(fill = "grey80", outlier.size = 0.5) +
+    labs(title = "ESR2 expression by ER status",
+         x = "ER (0 = neg, 1 = pos)", y = "log2(ESR2 TPM + 1)") +
+    theme_bw()
+
+  p2 <- ggplot(ratio_df, aes(x = factor(ER_status),
+                             y = log2(ESR1_to_ESR2 + 1),
+                             fill = condition)) +
+    geom_boxplot(outlier.size = 0.5) +
+    scale_fill_manual(values = c("non_progressor"="grey70",
+                                 "progressor"="grey30")) +
+    labs(title = "ESR1 / ESR2 ratio by ER status × progression",
+         x = "ER (0 = neg, 1 = pos)",
+         y = "log2(ESR1/ESR2 + 1)", fill = "Group") +
+    theme_bw()
+  print(p1); print(p2)
+  ggsave(file.path(OUT_DIR, "ESR2_by_ER.png"),         p1, width = 6, height = 5, dpi = 200, bg = "white")
+  ggsave(file.path(OUT_DIR, "ESR1_ESR2_ratio.png"),    p2, width = 7, height = 5, dpi = 200, bg = "white")
+  write.csv(ratio_df, file.path(OUT_DIR, "ESR1_ESR2_ratio_per_sample.csv"),
+            row.names = FALSE)
+}
+```
+
+
+# CHUNK 13: AR isoforms (whole cohort)
+```{r AR-isoforms}
+ar_results <- results[results$gene_name == "AR", cols]
+if (nrow(ar_results) > 0) {
+  print(ar_results)
+  write.csv(ar_results, file.path(OUT_DIR, "AR_isoforms_whole_cohort.csv"),
+            row.names = FALSE)
+  tryCatch(switchPlot(switchListAnalyzed, gene = "AR"),
+           error = function(e) cat("AR switchPlot failed:", e$message, "\n"))
+} else {
+  cat("AR not present in filtered results.\n")
+}
+```
+
+# CHUNK 14: Receptor-stratified switch analysis
+```{r stratified}
+run_stratified <- function(receptor_column, label, panel_genes) {
+  cat("\n── Stratified analysis:", label, "──\n")
+  rec_pos_ids <- clin$sample_id[
+    clin$tissue_pathology == "primary DCIS" &
+    clin$case_control %in% c("case","control") &
+    !is.na(clin[[receptor_column]]) &
+    as.character(clin[[receptor_column]]) == "1" ]
+
+  d <- myDesign[myDesign$sampleID %in% rec_pos_ids, ]
+  n_case <- sum(d$condition == "progressor")
+  n_ctrl <- sum(d$condition == "non_progressor")
+  cat("  Samples:", nrow(d), "(progressors =", n_case,
+      ", non-progressors =", n_ctrl, ")\n")
+  if (n_case < 5 || n_ctrl < 5) {
+    cat("  [SKIP] too few samples per group for reliable testing\n")
+    return(NULL)
+  }
+
+  subset_counts <- salmonQuant$counts[, c("isoform_id", d$sampleID)]
+  subset_abund  <- salmonQuant$abundance[, c("isoform_id", d$sampleID)]
+  keep <- subset_counts$isoform_id %in% annot_ids
+  subset_counts <- subset_counts[keep, ]
+  subset_abund  <- subset_abund[keep, ]
+
+  sub <- importRdata(
+    isoformCountMatrix   = subset_counts,
+    isoformRepExpression = subset_abund,
+    designMatrix         = d,
+    isoformExonAnnoation = GTF_FILE,
+    isoformNtFasta       = FASTA_FILE,
+    comparisonsToMake    = comparisonsToMake,
+    removeNonConvensionalChr = TRUE, showProgress = FALSE)
+
+  sub_filt <- preFilter(sub, geneExpressionCutoff = 1,
+                        IFcutoff = 0.01,
+                        removeSingleIsoformGenes = TRUE, quiet = TRUE)
+  sub_ana  <- isoformSwitchTestSatuRn(sub_filt, alpha = 0.05,
+                                      dIFcutoff = 0.1,
+                                      reduceToSwitchingGenes = FALSE)
+saveRDS(sub_ana, file.path(INTERMEDIATE, paste0("switchList_", label, "_qc98.rds")))
+
+  panel_res <- sub_ana$isoformFeatures[
+    sub_ana$isoformFeatures$gene_name %in% panel_genes, cols]
+  panel_res <- panel_res[order(panel_res$gene_name,
+                               -abs(panel_res$dIF)), ]
+  write.csv(panel_res, file.path(OUT_DIR, paste0("panel_", label, ".csv")),
+            row.names = FALSE)
+
+  sig <- panel_res[!is.na(panel_res$isoform_switch_q_value) &
+                   panel_res$isoform_switch_q_value < 0.05 &
+                   abs(panel_res$dIF) > 0.10, ]
+  cat("  Significant switches in", label, ":", nrow(sig), "\n")
+  if (nrow(sig) > 0) print(sig)
+  invisible(sub_ana)
+}
+
+# Restrict each receptor gene to its receptor-positive subset
+sub_ER       <- run_stratified("er",   "ER_positive",         "ESR1")
+sub_PR       <- run_stratified("pr",   "PR_positive",         "PGR")
+sub_HER2     <- run_stratified("her2", "HER2_positive",       "ERBB2")
+sub_AR_in_ER <- run_stratified("er",   "AR_in_ER_positive",   "AR")
+```
+
+
+# CHUNK 15: SIGLEC9 exploratory (below expression threshold)
+```{r siglec9-exploratory}
+SIGLEC9_ISO2 <- "ENST00000250360"   # canonical
+SIGLEC9_ISO1 <- "ENST00000440804"   # alternative protein-coding
+
+quant_files <- list.files(QUANT_DIR, pattern = "quant.sf$",
+                          recursive = TRUE, full.names = TRUE)
+sample_ids  <- basename(dirname(quant_files))
+keep_idx    <- match(myDesign$sampleID, sample_ids)
+keep_idx    <- keep_idx[!is.na(keep_idx)]
+
+if (length(keep_idx) > 0) {
+  siglec9_raw <- t(sapply(quant_files[keep_idx], function(f) {
+    d  <- read.table(f, header = TRUE, sep = "\t")
+    i2 <- d$TPM[grepl(SIGLEC9_ISO2, d$Name)]
+    i1 <- d$TPM[grepl(SIGLEC9_ISO1, d$Name)]
+    c(iso2 = ifelse(length(i2) > 0, i2, 0),
+      iso1 = ifelse(length(i1) > 0, i1, 0))
+  }))
+  siglec9_raw <- as.data.frame(siglec9_raw)
+  siglec9_raw$sampleID  <- sample_ids[keep_idx]
+  siglec9_raw$condition <- myDesign$condition[
+    match(siglec9_raw$sampleID, myDesign$sampleID)]
+  siglec9_raw$total_TPM <- siglec9_raw$iso2 + siglec9_raw$iso1
+
+  agg <- aggregate(cbind(iso1, iso2, total_TPM) ~ condition,
+                   data = siglec9_raw, FUN = mean)
+  sderr <- aggregate(cbind(iso1, iso2, total_TPM) ~ condition,
+                     data = siglec9_raw,
+                     FUN = function(x) sd(x) / sqrt(length(x)))
+  cat("SIGLEC9 average TPMs by condition:\n"); print(agg)
+  write.csv(siglec9_raw, file.path(OUT_DIR, "SIGLEC9_per_sample_TPM.csv"),
+            row.names = FALSE)
+
+  # 3-panel summary (gene expression / isoform expression / isoform usage)
+  iso_df <- data.frame(
+    Isoform   = rep(c("ENST00000250360 (canonical)",
+                      "ENST00000440804 (alternative)"), each = 2),
+    Condition = rep(c("non_progressor","progressor"), 2),
+    TPM       = c(agg$iso2, agg$iso1),
+    SEM       = c(sderr$iso2, sderr$iso1))
+  iso_df$Condition <- factor(iso_df$Condition,
+                             levels = c("non_progressor","progressor"))
+  p_iso <- ggplot(iso_df, aes(x = Isoform, y = TPM, fill = Condition)) +
+    geom_bar(stat = "identity", position = position_dodge(0.7),
+             width = 0.6, colour = "black") +
+    geom_errorbar(aes(ymin = pmax(TPM - SEM, 0), ymax = TPM + SEM),
+                  position = position_dodge(0.7), width = 0.2) +
+    scale_fill_manual(values = c("non_progressor"="grey70",
+                                 "progressor"="grey30")) +
+    labs(title = "SIGLEC9 isoform expression (exploratory, below threshold)",
+         x = NULL, y = "TPM") +
+    theme_bw() + theme(axis.text.x = element_text(angle = 25, hjust = 1))
+  print(p_iso)
+  ggsave(file.path(OUT_DIR, "SIGLEC9_exploratory.png"),
+         p_iso, width = 8, height = 5, dpi = 200, bg = "white")
+}
+```
+
+# CHUNK 15B: ESR2 (ERβ) exploratory — below expression threshold
+# Same pattern as SIGLEC9: read raw Salmon quants, no formal test.
+```{r esr2-exploratory, fig.height = 5, fig.width = 10}
+ESR2_ISO_BETA1   <- "ENST00000216442"   # ERβ1 — canonical 530aa
+ESR2_ISO_BETA_CX <- "ENST00000337505"   # ERβ-cx / ERβ2 — alternative
+
+quant_files <- list.files(QUANT_DIR, pattern = "quant.sf$",
+                          recursive = TRUE, full.names = TRUE)
+sample_ids  <- basename(dirname(quant_files))
+keep_idx    <- match(myDesign$sampleID, sample_ids)
+keep_idx    <- keep_idx[!is.na(keep_idx)]
+
+if (length(keep_idx) > 0) {
+  esr2_raw <- t(sapply(quant_files[keep_idx], function(f) {
+    d  <- read.table(f, header = TRUE, sep = "\t")
+    b1 <- d$TPM[grepl(ESR2_ISO_BETA1,   d$Name)]
+    bx <- d$TPM[grepl(ESR2_ISO_BETA_CX, d$Name)]
+    c(beta1  = ifelse(length(b1) > 0, b1, 0),
+      betacx = ifelse(length(bx) > 0, bx, 0))
+  }))
+  esr2_raw <- as.data.frame(esr2_raw)
+  esr2_raw$sampleID  <- sample_ids[keep_idx]
+  esr2_raw$condition <- myDesign$condition[
+    match(esr2_raw$sampleID, myDesign$sampleID)]
+  esr2_raw$total_TPM <- esr2_raw$beta1 + esr2_raw$betacx
+  esr2_raw$ER_status <- clin$er[match(esr2_raw$sampleID, clin$sample_id)]
+
+  agg <- aggregate(cbind(beta1, betacx, total_TPM) ~ condition,
+                   data = esr2_raw, FUN = mean)
+  sderr <- aggregate(cbind(beta1, betacx, total_TPM) ~ condition,
+                     data = esr2_raw,
+                     FUN = function(x) sd(x) / sqrt(length(x)))
+  cat("ESR2 average TPMs by condition:\n"); print(agg)
+  cat("\nDetection: beta1 > 0 in", sum(esr2_raw$beta1 > 0),
+      "/", nrow(esr2_raw), "samples; beta-cx > 0 in",
+      sum(esr2_raw$betacx > 0), "/", nrow(esr2_raw), "samples\n")
+
+  write.csv(esr2_raw, file.path(OUT_DIR, "ESR2_per_sample_TPM.csv"),
+            row.names = FALSE)
+
+  # 2-panel: isoform TPM + isoform usage (skip gene panel because TPM ≈ 0)
+  iso_df <- data.frame(
+    Isoform   = rep(c("ENST00000216442 (ERβ1 canonical)",
+                      "ENST00000337505 (ERβ-cx alternative)"), each = 2),
+    Condition = rep(c("non_progressor","progressor"), 2),
+    TPM       = c(agg$beta1, agg$betacx),
+    SEM       = c(sderr$beta1, sderr$betacx))
+  iso_df$Condition <- factor(iso_df$Condition,
+                             levels = c("non_progressor","progressor"))
+
+  p_iso <- ggplot(iso_df, aes(x = Isoform, y = TPM, fill = Condition)) +
+    geom_bar(stat = "identity", position = position_dodge(0.7),
+             width = 0.6, colour = "black") +
+    geom_errorbar(aes(ymin = pmax(TPM - SEM, 0), ymax = TPM + SEM),
+                  position = position_dodge(0.7), width = 0.2) +
+    scale_fill_manual(values = c("non_progressor"="grey70",
+                                 "progressor"="grey30")) +
+    labs(title = "ESR2 isoform expression (exploratory, below threshold)",
+         x = NULL, y = "TPM") +
+    theme_bw() + theme(axis.text.x = element_text(angle = 25, hjust = 1))
+  print(p_iso)
+  ggsave(file.path(OUT_DIR, "ESR2_exploratory.png"),
+         p_iso, width = 9, height = 5, dpi = 200, bg = "white")
+}
+```
+
+
+
+# CHUNK 16: Switch plots for original candidate genes
+```{r switch-plots-original}
+for (gene in ORIGINAL) {
+  gene_check <- results[results$gene_name == gene, ]
+  if (nrow(gene_check) > 0) {
+    tryCatch({
+      switchPlot(switchListAnalyzed, gene = gene)
+      cat(gene, ": plot generated\n")
+    }, error = function(e) {
+      cat(gene, ": plot failed -", e$message, "\n")
+    })
+  } else {
+    cat(gene, ": not in filtered results\n")
+  }
+}
+```
+
+# CHUNK 16B: switchPlot for the 7 whole-transcriptome strict hits
+```{r switch-plots-strict-7}
+
+download_dir <- OUT_DIR     # = DIR_ISOFORM = results/isoform (from config.R)
+dir.create(download_dir, showWarnings = FALSE, recursive = TRUE)
+
+the_7_strict <- c("TOP2A","HLA-B","ACTR3","RTKN2","TMEM59","SLC4A1AP",
+                  "ENSG00000264968")
+
+for (gene in the_7_strict) {
+  tryCatch({
+    png(file.path(download_dir, paste0("switch_", gene, ".png")),
+        width = 11, height = 7, units = "in", res = 200)
+    switchPlot(switchListAnalyzed, gene = gene)
+    dev.off()
+  }, error = function(e) {
+    if (length(dev.list())) dev.off()   # close device if switchPlot threw mid-draw
+    cat(gene, ": failed -", e$message, "\n")
+  })
+}
+
+cat("Saved", length(the_7_strict), "plots to:", download_dir, "\n")
+```
+
+# CHUNK 17: Optional — large driver list (R2CPCT)
+```{r large-driver-list, eval = FALSE}
+
+DRIVER_URL <- "https://github.com/J0bbie/R2CPCT/raw/ba9df4736078410c7036d961ec4e874105f7747c/data/driverList.rda"
+download.file(DRIVER_URL, file.path(OUT_DIR, "driverList.rda"))
+load(file.path(OUT_DIR, "driverList.rda"))
+
+# Inspect object structure
+cat("driverList class:", class(driverList), "\n")
+# str(driverList); head(driverList)
+
+# Extract gene symbols — column name depends on object type
+if (is.data.frame(driverList) && "Hugo_Symbol" %in% colnames(driverList)) {
+  LARGE_PANEL <- unique(driverList$Hugo_Symbol)
+} else if (is.character(driverList)) {
+  LARGE_PANEL <- unique(driverList)
+} else {
+  stop("Inspect driverList manually to extract gene symbols.")
+}
+cat("Large panel:", length(LARGE_PANEL), "driver genes\n")
+
+big_panel <- results[results$gene_name %in% LARGE_PANEL, cols]
+big_panel <- big_panel[order(big_panel$gene_name, -abs(big_panel$dIF)), ]
+write.csv(big_panel,
+          file.path(OUT_DIR, "large_driver_panel_all_cohort.csv"),
+          row.names = FALSE)
+
+big_sig <- big_panel[!is.na(big_panel$isoform_switch_q_value) &
+                     big_panel$isoform_switch_q_value < 0.05 &
+                     abs(big_panel$dIF) > 0.10, ]
+cat("Large panel — significant switches:", nrow(big_sig), "\n")
+print(head(big_sig, 30))
+write.csv(big_sig, file.path(OUT_DIR, "large_driver_panel_significant.csv"),
+          row.names = FALSE)
+```
+
+# CHUNK 18: Final file index
+```{r file-index}
+cat("\n=== Files written to", OUT_DIR, "===\n")
+print(list.files(OUT_DIR))
+```

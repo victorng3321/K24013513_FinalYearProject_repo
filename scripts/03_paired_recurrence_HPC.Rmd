@@ -1,0 +1,188 @@
+```{r}
+source("config.R")
+```
+
+#Load library
+```{r}
+library(DESeq2)
+library(edgeR)        
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+options(stringsAsFactors = FALSE)
+```
+
+```{r}
+COUNTDIR <- file.path(BASEDIR, "counts")
+CLINDIR  <- file.path(BASEDIR, "clinical")
+OUTDIR <- DIR_PAIRED
+
+if (!dir.exists(OUTDIR)) dir.create(OUTDIR, recursive = TRUE)
+cat("Output will be written to:", OUTDIR, "\n")
+
+raw_counts <- read.delim(file.path(COUNTDIR, "DEA_counts.tsv"),
+                         row.names = 1, check.names = FALSE)
+anno       <- read.delim(file.path(COUNTDIR, "gene_symbols.tsv"),
+                         check.names = FALSE)
+meta_all   <- read.delim(file.path(CLINDIR, "all_samples.txt"),
+                         check.names = FALSE,
+                         na.strings = c("NA","N/A","999",""))
+```
+
+```{r}
+# Select patients with at least one ipsilateral recurrence
+ipsi_pts <- meta_all %>%
+  filter(tissue_pathology %in% c("ipsilateral DCIS", "ipsilateral IBC")) %>%
+  pull(patient_id) %>% unique()
+
+# Keep only those who also have a Primary sample
+primary_pts <- meta_all$patient_id[meta_all$tissue == "Primary"]
+paired_pts  <- intersect(ipsi_pts, primary_pts)
+cat("Paired patients:", length(paired_pts), "\n")   # expect 19
+
+# Pick one Primary per patient (first by sample_id) and one Recurrence per patient (prefer IBC > DCIS)
+pick_one <- function(df, tissue_priority = NULL) {
+  if (!is.null(tissue_priority))
+    df <- df[order(match(df$tissue_pathology, tissue_priority)), ]
+  df[1, , drop = FALSE]
+}
+
+primaries <- meta_all %>%
+  filter(patient_id %in% paired_pts, tissue == "Primary") %>%
+  group_by(patient_id) %>% group_modify(~ pick_one(.x)) %>% ungroup()
+
+recurrences <- meta_all %>%
+  filter(patient_id %in% paired_pts,
+         tissue_pathology %in% c("ipsilateral DCIS", "ipsilateral IBC")) %>%
+  group_by(patient_id) %>%
+  group_modify(~ pick_one(.x,
+                          tissue_priority = c("ipsilateral IBC",
+                                              "ipsilateral DCIS"))) %>%
+  ungroup()
+
+meta_paired <- bind_rows(primaries, recurrences) %>%
+  mutate(tissue_state = factor(ifelse(tissue == "Primary",
+                                      "Primary", "Recurrence"),
+                               levels = c("Primary", "Recurrence")),
+         patient_id   = factor(patient_id)) %>%
+  arrange(patient_id, tissue_state)
+
+cat("Final paired matrix:", nrow(meta_paired), "samples\n")
+print(table(meta_paired$tissue_state))
+stopifnot(nrow(meta_paired) == 2 * length(paired_pts))
+```
+
+```{r}
+shared <- intersect(colnames(raw_counts), meta_paired$sample_id)
+counts <- raw_counts[, shared]
+meta_paired <- meta_paired[match(shared, meta_paired$sample_id), ]
+rownames(meta_paired) <- meta_paired$sample_id
+stopifnot(identical(colnames(counts), as.character(meta_paired$sample_id)))
+cat("Aligned:", nrow(counts), "genes x", ncol(counts), "samples\n")
+```
+
+```{r}
+# Mirroring the WGCNA biotype filter
+keep_biotype <- anno$ensembl_gene_id[
+  anno$gene_biotype %in% c("protein_coding", "lncRNA")]
+counts <- counts[rownames(counts) %in% keep_biotype, ]
+cat("After biotype filter:", nrow(counts), "genes\n")
+
+# Expression filter using the tissue contrast
+y    <- DGEList(counts = counts, group = meta_paired$tissue_state)
+keep <- filterByExpr(y, group = meta_paired$tissue_state)
+counts_filt <- counts[keep, ]
+cat("After filterByExpr:", nrow(counts_filt), "genes\n")
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filt,
+  colData   = meta_paired,
+  design    = ~ patient_id + tissue_state)
+
+cat("Design rank check:\n")
+print(qr(model.matrix(design(dds), colData(dds)))$rank)
+print(ncol(model.matrix(design(dds), colData(dds))))
+```
+
+```{r}
+dds <- DESeq(dds)
+resultsNames(dds)                                
+res <- results(dds, name = "tissue_state_Recurrence_vs_Primary")
+res_shrunk <- lfcShrink(dds, coef = "tissue_state_Recurrence_vs_Primary",
+                        type = "apeglm")
+summary(res_shrunk)
+```
+
+```{r}
+res_df <- as.data.frame(res_shrunk) %>%
+  tibble::rownames_to_column("ensembl_gene_id") %>%
+  left_join(anno[, c("ensembl_gene_id", "hgnc_symbol", "gene_biotype")],
+            by = "ensembl_gene_id") %>%
+  mutate(diffexpressed = case_when(
+    is.na(padj)                              ~ "NO",
+    padj < 0.05 & log2FoldChange >  0.5      ~ "UP",
+    padj < 0.05 & log2FoldChange < -0.5      ~ "DOWN",
+    TRUE                                     ~ "NO"))
+
+cat("DEGs at |log2FC|>0.5 & padj<0.05:\n")
+print(table(res_df$diffexpressed))
+cat("\nBy biotype:\n")
+print(table(res_df$gene_biotype, res_df$diffexpressed))
+```
+
+```{r}
+vst_mat <- vst(dds, blind = FALSE)
+pca_df  <- plotPCA(vst_mat, intgroup = c("tissue_state", "patient_id"),
+                   returnData = TRUE)
+pv <- round(100 * attr(pca_df, "percentVar"))
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2,
+                            colour = tissue_state, group = patient_id)) +
+  geom_line(colour = "grey70", linewidth = 0.3) +    # connects pairs
+  geom_point(size = 3) +
+  labs(x = paste0("PC1 (", pv[1], "%)"),
+       y = paste0("PC2 (", pv[2], "%)"),
+       title = "Paired primary vs recurrence (lines = same patient)") +
+  theme_bw()
+
+p_volc <- ggplot(res_df, aes(log2FoldChange, -log10(padj),
+                             colour = diffexpressed)) +
+  geom_point(alpha = 0.5) +
+  scale_colour_manual(values = c(UP="#C00000", DOWN="#0070C0", NO="grey70")) +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype="dashed") +
+  geom_text_repel(data = res_df %>%
+                    filter(diffexpressed != "NO") %>%
+                    arrange(padj) %>% head(20),
+                  aes(label = hgnc_symbol), size = 3, max.overlaps = 25) +
+  labs(title = "Primary vs Recurrence (apeglm-shrunk)") +
+  theme_bw()
+
+print(p_pca); print(p_volc)
+```
+
+```{r}
+out_df <- res_df %>%
+  select(ensembl_gene_id, hgnc_symbol, gene_biotype,
+         baseMean, log2FoldChange, lfcSE,
+         pvalue, padj, diffexpressed)
+rownames(out_df) <- out_df$ensembl_gene_id
+out_df$ensembl_gene_id <- NULL
+
+write.table(out_df,
+            file.path(OUTDIR, "primary_vs_recurrence_DEgenes.tsv"),
+            sep = "\t", quote = FALSE, row.names = TRUE)
+
+cat("Written to:", file.path(OUTDIR, "primary_vs_recurrence_DEgenes.tsv"), "\n")
+saveRDS(dds, file.path(INTERMEDIATE, "primary_vs_recurrence_dds.rds"))
+```
+
+```{r}
+ggsave(file.path(OUTDIR, "primary_vs_recurrence_PCA.png"),
+       p_pca,  width = 7, height = 5, dpi = 200, bg = "white")
+ggsave(file.path(OUTDIR, "primary_vs_recurrence_volcano.png"),
+       p_volc, width = 8, height = 6, dpi = 200, bg = "white")
+```
+

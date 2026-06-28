@@ -1,0 +1,27 @@
+nodeName	altName	nodeAttr[nodesPresent, ]
+MT-ND4	NA	lightsteelblue1
+MT-ND4L	NA	lightsteelblue1
+MT-CYB	NA	lightsteelblue1
+MT-CO2	NA	lightsteelblue1
+MT-ND1	NA	lightsteelblue1
+MT-ND3	NA	lightsteelblue1
+MT-CO3	NA	lightsteelblue1
+MT-ATP8	NA	lightsteelblue1
+MT-CO1	NA	lightsteelblue1
+ENSG00000310376	NA	lightsteelblue1
+FP671120.1	NA	lightsteelblue1
+PTP4A2	NA	lightsteelblue1
+GGCT	NA	lightsteelblue1
+FP236383.1	NA	lightsteelblue1
+MEA1	NA	lightsteelblue1
+ENSG00000289899	NA	lightsteelblue1
+ENSG00000286171	NA	lightsteelblue1
+DNAJB4	NA	lightsteelblue1
+NOP16	NA	lightsteelblue1
+ENSG00000305511	NA	lightsteelblue1
+ENSG00000290689	NA	lightsteelblue1
+GPATCH4	NA	lightsteelblue1
+HINT1	NA	lightsteelblue1
+H3-5	NA	lightsteelblue1
+NDUFS5	NA	lightsteelblue1
+PDHA1	NA	lightsteelblue1

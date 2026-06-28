@@ -1,0 +1,8 @@
+*.rds
+*.RData
+*.sif
+*.html
+*.out
+*.log
+*_per_sample_*
+datExpr*

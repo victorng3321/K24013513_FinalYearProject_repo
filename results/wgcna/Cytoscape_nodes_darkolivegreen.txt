@@ -1,0 +1,15 @@
+nodeName	altName	nodeAttr[nodesPresent, ]
+DNAJB4	NA	darkolivegreen
+ENSG00000299052	NA	darkolivegreen
+ENSG00000294793	NA	darkolivegreen
+NTN3	NA	darkolivegreen
+AL358779.1	NA	darkolivegreen
+S1PR5	NA	darkolivegreen
+ENSG00000293496	NA	darkolivegreen
+DDN-AS1	NA	darkolivegreen
+ITPR3-AS1	NA	darkolivegreen
+ENSG00000297475	NA	darkolivegreen
+ENSG00000294749	NA	darkolivegreen
+ENSG00000294920	NA	darkolivegreen
+ENSG00000306443	NA	darkolivegreen
+ENSG00000287815	NA	darkolivegreen

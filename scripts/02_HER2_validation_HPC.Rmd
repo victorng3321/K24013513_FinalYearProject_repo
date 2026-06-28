@@ -1,0 +1,60 @@
+```{r}
+source("config.R")
+```
+
+#Load library 
+```{r}
+library(dplyr); library(ggplot2); library(pROC)
+```
+
+# Load WGCNA workspace
+```{r}
+load(file.path(INTERMEDIATE, "WGCNA_v5_workspace.RData"))
+```
+
+# Build HER2 status vector (0=neg, 1=pos), aligned to ME rows
+```{r}
+meta_full <- read.delim(file.path(DIR_QC, "DEA_samples_QCmetrics.tsv"))
+
+her2_raw  <- as.character(meta_full$her2[match(rownames(mergedMEs), meta_full$sample_id)])
+her2_bin  <- dplyr::case_when(
+  her2_raw == "0" ~ "HER2-negative",
+  her2_raw == "1" ~ "HER2-positive",
+  TRUE            ~ NA_character_)              # 2 (equivocal) and 999 -> NA
+her2_bin  <- factor(her2_bin, levels = c("HER2-negative", "HER2-positive"))
+```
+
+# 3) Per-module ME vs HER2 — boxplot + Wilcoxon test
+```{r}
+for (mod in c("darkorange", "violet")) {
+  me_col <- paste0("ME", mod)
+  df <- data.frame(ME = mergedMEs[[me_col]], HER2 = her2_bin) %>%
+        filter(!is.na(HER2))
+
+  w <- wilcox.test(ME ~ HER2, data = df)
+  cat(sprintf("\n=== %s ===\n  n HER2-: %d   n HER2+: %d\n  Wilcoxon p = %.3g\n",
+              mod, sum(df$HER2 == "HER2-negative"),
+              sum(df$HER2 == "HER2-positive"), w$p.value))
+
+  print(
+    ggplot(df, aes(HER2, ME, fill = HER2)) +
+      geom_boxplot(width = 0.5, outlier.size = 0.8) +
+      geom_jitter(width = 0.15, alpha = 0.5, size = 1) +
+      scale_fill_manual(values = c("HER2-negative" = "grey70",
+                                   "HER2-positive" = "#C00000")) +
+      labs(title = paste0("ME", mod, " vs HER2 status"),
+           subtitle = sprintf("Wilcoxon p = %.3g", w$p.value),
+           y = paste0("ME", mod), x = NULL) +
+      theme_bw() + theme(legend.position = "none"))
+```
+
+# 4) ROC / AUC — how well does ME discriminate HER2+ vs HER2
+```{r}
+  r <- roc(response = df$HER2, predictor = df$ME,
+           levels = c("HER2-negative", "HER2-positive"), direction = "<")
+  cat(sprintf("  AUC = %.3f (95%% CI %.3f-%.3f)\n",
+              auc(r), ci.auc(r)[1], ci.auc(r)[3]))
+  plot(r, main = paste0("ROC: ME", mod, " predicts HER2+"))
+}
+```
+

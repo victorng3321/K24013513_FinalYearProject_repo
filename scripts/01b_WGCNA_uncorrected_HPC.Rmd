@@ -1,0 +1,1011 @@
+
+```{r}
+source("config.R")
+# --- Task B (uncorrected) output namespace; never touches results/wgcna ---
+DIR_WGCNA_UNCORR <- file.path(RESULTS, "wgcna_uncorrected")
+dir.create(file.path(DIR_WGCNA_UNCORR, "figures"), showWarnings = FALSE, recursive = TRUE)
+knitr::opts_chunk$set(dev = "png", dpi = 300,
+                      fig.path = file.path(DIR_WGCNA_UNCORR, "figures/"))
+```
+
+# CHUNK 1: Libraries
+```{r setup, message = FALSE, warning = FALSE}
+library(WGCNA)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+library(ggrepel)
+library(msigdbr)
+library(fgsea)
+library(patchwork)
+library(scales)
+```
+
+
+# CHUNK 2: Paths
+```{r paths}
+COUNTDIR <- file.path(BASEDIR, "counts")
+QCDIR    <- file.path(BASEDIR, "qc")
+OUTDIR     <- DIR_WGCNA_UNCORR
+DIR_ENRICH <- file.path(DIR_WGCNA_UNCORR, "enrichment")        # redirect (was config global)
+DIR_NETFIG <- file.path(DIR_WGCNA_UNCORR, "network_figures")   # redirect (was config global)
+for (d in c(OUTDIR, DIR_ENRICH, DIR_NETFIG))
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+cat("Task B (uncorrected) output ->", OUTDIR, "\n")
+```
+
+# CHUNK 3: Load raw data
+```{r load-data}
+raw_counts <- read.delim(file.path(COUNTDIR, "DEA_counts.tsv"),
+                         row.names = 1, check.names = FALSE)
+anno  <- read.delim(file.path(COUNTDIR, "gene_symbols.tsv"), check.names = FALSE)
+meta0 <- read.delim(file.path(QCDIR, "DEA_samples_QCmetrics.tsv"),
+                    check.names = FALSE)
+cat("Raw counts:", nrow(raw_counts), "genes ×", ncol(raw_counts), "samples\n")
+cat("Annotation:", nrow(anno), "genes\n")
+cat("Metadata  :", nrow(meta0), "samples\n")
+```
+
+
+# CHUNK 4: Filter metadata
+```{r filter-metadata}
+meta <- meta0 %>%
+  filter(case_control %in% c("case", "control"),
+         tissue_pathology == "primary DCIS",
+         is.na(final_qc) | trimws(as.character(final_qc)) == "") %>%
+  distinct(sample_id, .keep_all = TRUE)
+cat("Samples after filtering:", nrow(meta), "\n")
+cat("  Case   :", sum(meta$case_control == "case"),    "\n")
+cat("  Control:", sum(meta$case_control == "control"), "\n")
+cat("\nBatch × case_control table:\n")
+print(table(meta$batch, meta$case_control))
+cat("\nFisher's exact test (avoids the chi-square zero-cell warning):\n")
+print(fisher.test(table(meta$batch, meta$case_control)))
+```
+
+
+# CHUNK 5: Align counts to metadata
+```{r align-samples}
+shared_samples <- intersect(colnames(raw_counts), meta$sample_id)
+counts <- raw_counts[, shared_samples]
+meta   <- meta[match(shared_samples, meta$sample_id), ]
+rownames(meta) <- meta$sample_id
+stopifnot(identical(colnames(counts), meta$sample_id))
+cat("Aligned matrix:", nrow(counts), "genes ×", ncol(counts), "samples\n")
+```
+
+
+# CHUNK 6: Biotype filter (protein_coding + lncRNA)
+```{r biotype-filter}
+keep_biotype <- anno$ensembl_gene_id[anno$gene_biotype %in% c("protein_coding", "lncRNA")]
+counts <- counts[rownames(counts) %in% keep_biotype, ]
+cat("After biotype filter:", nrow(counts), "genes\n")
+```
+
+
+# CHUNK 7: Expression filter (edgeR::filterByExpr)
+```{r filter-expression}
+group_factor <- factor(meta$case_control)
+batch_factor <- factor(meta$batch)
+y <- DGEList(counts = counts, group = group_factor)
+keep <- filterByExpr(y, group = group_factor)
+y <- y[keep, , keep.lib.sizes = FALSE]
+cat("After expression filter:", nrow(y), "genes\n")
+```
+
+
+# CHUNK 8: TMM + voom 
+```{r normalise-voom, fig.width = 7, fig.height = 5}
+while (!is.null(dev.list())) dev.off()       # clear any stale devices
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
+y <- calcNormFactors(y, method = "TMM")
+design <- model.matrix(~ 0 + group_factor)
+colnames(design) <- levels(group_factor)
+v <- voom(y, design, plot = TRUE)
+cat("Voom matrix:", nrow(v$E), "genes ×", ncol(v$E), "samples\n")
+```
+
+
+# CHUNK 8A: PCA before batch correction
+```{r pca-before, fig.width = 7, fig.height = 5}
+pca_before <- prcomp(t(v$E), center = TRUE, scale. = FALSE)
+var_before <- summary(pca_before)$importance[2, 1:5]
+df_before  <- data.frame(PC1 = pca_before$x[, 1],
+                         PC2 = pca_before$x[, 2],
+                         batch = batch_factor,
+                         case_control = group_factor)
+print(ggplot(df_before, aes(PC1, PC2, colour = batch, shape = case_control)) +
+        geom_point(size = 3) +
+        labs(title = "PCA before batch correction",
+             x = sprintf("PC1 (%.1f%%)", 100 * var_before[1]),
+             y = sprintf("PC2 (%.1f%%)", 100 * var_before[2])) +
+        theme_bw())
+cat("BEFORE — PC1 ~ batch F =",
+    summary(aov(pca_before$x[,1] ~ batch_factor))[[1]]$"F value"[1],
+    "| PC1 ~ case F =",
+    summary(aov(pca_before$x[,1] ~ group_factor))[[1]]$"F value"[1], "\n")
+```
+
+
+# CHUNK 8B: Batch correction
+```{r batch-correct}
+# Task B (MR48): batch is NOT regressed out of the matrix. The voom matrix is
+# left UNCORRECTED; batch is instead adjusted for at the module-trait stage
+# (lm(ME ~ trait + batch), Chunk 24B). This avoids removing case/control variance
+# that is partially aliased with batch (Batch 1 = all progressors).
+cat("Task B: limma::removeBatchEffect SKIPPED - voom matrix left uncorrected.\n")
+```
+
+
+# CHUNK 8C: PCA of the (uncorrected) matrix used for the network — batch retained
+```{r pca-after, fig.width = 7, fig.height = 5}
+pca_after <- prcomp(t(v$E), center = TRUE, scale. = FALSE)
+var_after <- summary(pca_after)$importance[2, 1:5]
+df_after  <- data.frame(PC1 = pca_after$x[, 1],
+                        PC2 = pca_after$x[, 2],
+                        batch = batch_factor,
+                        case_control = group_factor)
+print(ggplot(df_after, aes(PC1, PC2, colour = batch, shape = case_control)) +
+        geom_point(size = 3) +
+        labs(title = "PCA (uncorrected matrix, batch retained)",
+             x = sprintf("PC1 (%.1f%%)", 100 * var_after[1]),
+             y = sprintf("PC2 (%.1f%%)", 100 * var_after[2])) +
+        theme_bw())
+cat("AFTER  — PC1 ~ batch F =",
+    summary(aov(pca_after$x[,1] ~ batch_factor))[[1]]$"F value"[1],
+    "| PC1 ~ case F =",
+    summary(aov(pca_after$x[,1] ~ group_factor))[[1]]$"F value"[1], "\n")
+```
+
+
+# CHUNK 9: log2(RPKM+1)
+```{r rpkm-biotype}
+gene_lengths_all <- setNames(anno$width, anno$ensembl_gene_id)
+gene_lengths_y   <- gene_lengths_all[rownames(y$counts)]
+rpkm_matrix      <- rpkm(y, gene.length = gene_lengths_y)
+log2rpkm_mat     <- log2(rpkm_matrix + 1)
+log2rpkm_data    <- t(log2rpkm_mat)
+```
+
+
+# CHUNK 10: Transpose for WGCNA
+```{r wgcna-input}
+expression.data <- t(v$E)
+cat("WGCNA input: samples =", nrow(expression.data),
+    ", genes =", ncol(expression.data), "\n")
+```
+
+# CHUNK 11: goodSamplesGenes
+```{r quality-check}
+gsg <- goodSamplesGenes(expression.data, verbose = 3)
+if (!gsg$allOK) {
+  expression.data <- expression.data[gsg$goodSamples, gsg$goodGenes]
+  meta <- meta[meta$sample_id %in% rownames(expression.data), ]
+}
+cat("Final matrix:", nrow(expression.data), "samples ×",
+    ncol(expression.data), "genes\n")
+```
+
+
+# CHUNK 12: Sample clustering
+```{r sample-clustering, fig.width = 14, fig.height = 5}
+sampleTree <- hclust(dist(expression.data), method = "average")
+par(mar = c(0, 4, 2, 0))
+plot(sampleTree, main = "Sample clustering after limma batch correction",
+     sub = "", xlab = "")
+```
+
+
+# CHUNK 13: Trait dataframe
+```{r trait-setup}
+to_na <- function(x, na_vals = c("", "NA", "N/A", "999", "unknown", "Unknown")) {
+  x <- trimws(as.character(x)); x[x %in% na_vals] <- NA; x
+}
+recode_bin <- function(x, one_vals, zero_vals) {
+  x <- to_na(x); out <- rep(NA_real_, length(x))
+  out[tolower(x) %in% tolower(one_vals)]  <- 1
+  out[tolower(x) %in% tolower(zero_vals)] <- 0
+  out
+}
+recode_ord <- function(x, allowed) {
+  x <- suppressWarnings(as.numeric(to_na(x))); x[!x %in% allowed] <- NA; x
+}
+allTraits <- data.frame(
+  sample_id    = meta$sample_id,
+  case_control = recode_bin(meta$case_control, "case", "control"),
+  ER           = recode_ord(meta$er,  c(0, 1)),
+  PR           = recode_ord(meta$pr,  c(0, 1)),
+  HER2         = recode_ord(meta$her2, c(0, 1, 2)),
+  radiotherapy = recode_ord(meta$radiotherapy, c(0, 1)),
+  grade        = recode_ord(meta$grade, c(1, 2, 3)))
+allTraits$HER2 <- ifelse(allTraits$HER2 == 2, NA_real_, allTraits$HER2)
+Samples   <- rownames(expression.data)
+traitRows <- match(Samples, allTraits$sample_id)
+stopifnot(!any(is.na(traitRows)))
+datTraits <- allTraits[traitRows, -1, drop = FALSE]
+rownames(datTraits) <- Samples
+```
+
+
+# CHUNK 14-15: Soft threshold
+```{r soft-threshold, fig.width = 10, fig.height = 5}
+while (!is.null(dev.list())) dev.off()
+spt <- pickSoftThreshold(expression.data, networkType = "signed hybrid", verbose = 5)
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+plot(spt$fitIndices[, 1], -sign(spt$fitIndices[, 3]) * spt$fitIndices[, 2],
+     xlab = "Soft threshold (β)", ylab = "Scale-free fit (signed R²)",
+     type = "n", main = "Scale independence")
+text(spt$fitIndices[, 1], -sign(spt$fitIndices[, 3]) * spt$fitIndices[, 2],
+     labels = spt$fitIndices[, 1], col = "red")
+abline(h = 0.85, col = "red")
+plot(spt$fitIndices[, 1], spt$fitIndices[, 5],
+     xlab = "Soft threshold (β)", ylab = "Mean connectivity",
+     type = "n", main = "Mean connectivity")
+text(spt$fitIndices[, 1], spt$fitIndices[, 5],
+     labels = spt$fitIndices[, 1], col = "red")
+
+# --- Re-pick beta on the UNCORRECTED matrix (do not assume the corrected beta = 6) ---
+fi <- spt$fitIndices
+fi$signedR2 <- -sign(fi[, 3]) * fi[, 2]
+cat("\nSoft-threshold fit on uncorrected matrix:\n")
+print(fi[, c("Power", "signedR2", "mean.k.")])
+cand <- fi$Power[fi$signedR2 >= 0.85]
+softPower <- if (length(cand)) min(cand) else
+             if (!is.na(spt$powerEstimate)) spt$powerEstimate else 6
+cat(sprintf("Chosen softPower (uncorrected) = %d (signed R2 = %.3f; corrected baseline was 6)\n",
+            softPower, fi$signedR2[fi$Power == softPower]))
+write.csv(fi, file.path(OUTDIR, "soft_threshold_fit_uncorrected.csv"), row.names = FALSE)
+```
+
+
+# CHUNK 16-17: Adjacency + TOM
+```{r adjacency-tom}
+adjacency <- adjacency(expression.data, power = softPower, type = "signed hybrid")
+TOM <- TOMsimilarity(adjacency, TOMType = "signed")
+TOM.dissimilarity <- 1 - TOM
+```
+
+# CHUNK 18-22: Module detection + merge
+```{r modules, fig.width = 12, fig.height = 7}
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average")
+Modules <- cutreeDynamic(dendro = geneTree, distM = TOM.dissimilarity,
+                         deepSplit = 1, pamRespectsDendro = FALSE,
+                         minClusterSize = 50)
+ModuleColors <- labels2colors(Modules)
+MElist <- moduleEigengenes(expression.data, colors = ModuleColors)
+merge        <- mergeCloseModules(expression.data, ModuleColors, cutHeight = 0.25)
+mergedColors <- merge$colors
+mergedMEs    <- merge$newMEs
+names(mergedColors) <- colnames(expression.data)
+cat("Merged modules:\n"); print(table(mergedColors))
+plotDendroAndColors(geneTree, cbind(ModuleColors, mergedColors),
+                    c("Original", "Merged"),
+                    dendroLabels = FALSE, hang = 0.03, addGuide = TRUE,
+                    guideHang = 0.05,
+                    main = "Gene dendrogram — original vs merged")
+```
+
+
+# CHUNK 23-24: Module-trait bicor
+```{r module-trait}
+common_samples    <- intersect(rownames(mergedMEs), rownames(datTraits))
+mergedMEs_matched <- mergedMEs[common_samples, ]
+traitData         <- datTraits[common_samples, , drop = FALSE]
+bicorResult <- bicorAndPvalue(mergedMEs_matched, traitData,
+                              use = "pairwise.complete.obs",
+                              pearsonFallback = "individual",
+                              maxPOutliers = 0.1)
+moduleTraitCor    <- bicorResult$bicor
+moduleTraitPvalue <- bicorResult$p
+moduleTraitPadj   <- matrix(
+  p.adjust(as.vector(moduleTraitPvalue), method = "BH"),
+  nrow = nrow(moduleTraitPvalue), ncol = ncol(moduleTraitPvalue),
+  dimnames = dimnames(moduleTraitPvalue))
+cat("FDR < 0.05:", sum(moduleTraitPadj < 0.05, na.rm = TRUE), "\n")
+```
+
+
+# CHUNK 24B: Batch-module check + batch-adjusted module-trait testing (MR48)
+```{r module-trait-batch-adjusted}
+## (i) align a batch factor to the module-eigengene rows
+batch_vec <- factor(meta$batch[match(common_samples, meta$sample_id)])
+stopifnot(length(batch_vec) == length(common_samples), !anyNA(batch_vec))
+
+## (ii) flag batch-driven modules: ANOVA of each ME on batch (+ case/control corr)
+mods <- colnames(mergedMEs_matched)
+batch_aov_p <- sapply(mods, function(m)
+  summary(aov(mergedMEs_matched[[m]] ~ batch_vec))[[1]][["Pr(>F)"]][1])
+cc_cor <- as.numeric(cor(mergedMEs_matched, traitData$case_control,
+                         use = "pairwise.complete.obs"))
+batch_flag <- data.frame(
+  module        = sub("^ME", "", mods),
+  batch_aov_p   = signif(batch_aov_p, 3),
+  batch_aov_FDR = signif(p.adjust(batch_aov_p, "BH"), 3),
+  cc_cor        = round(cc_cor, 3),
+  batch_driven  = p.adjust(batch_aov_p, "BH") < 0.05)
+batch_flag <- batch_flag[order(batch_flag$batch_aov_p), ]
+cat("\nBatch-driven modules (ME ~ batch, BH-FDR < 0.05):",
+    sum(batch_flag$batch_driven, na.rm = TRUE), "of", nrow(batch_flag), "\n")
+print(batch_flag)
+write.csv(batch_flag, file.path(OUTDIR, "module_batch_association.csv"), row.names = FALSE)
+
+## (iii) module-trait testing WITH batch adjustment: lm(ME ~ trait + batch)
+traits  <- colnames(traitData)
+lm_coef <- matrix(NA_real_, length(mods), length(traits), dimnames = list(mods, traits))
+lm_p    <- matrix(NA_real_, length(mods), length(traits), dimnames = list(mods, traits))
+for (m in mods) for (t in traits) {
+  d <- data.frame(ME = mergedMEs_matched[[m]], trait = traitData[[t]], batch = batch_vec)
+  d <- d[stats::complete.cases(d), ]
+  if (nrow(d) < 5 || length(unique(d$trait)) < 2 || length(unique(d$batch)) < 2) next
+  fit <- tryCatch(lm(ME ~ trait + batch, data = d), error = function(e) NULL)
+  if (is.null(fit)) next
+  co <- summary(fit)$coefficients
+  if ("trait" %in% rownames(co)) {
+    lm_coef[m, t] <- co["trait", "Estimate"]
+    lm_p[m, t]    <- co["trait", "Pr(>|t|)"]
+  }
+}
+lm_padj <- matrix(p.adjust(as.vector(lm_p), method = "BH"),
+                  nrow = nrow(lm_p), dimnames = dimnames(lm_p))
+cat("\nBatch-adjusted lm(ME ~ trait + batch): module-trait pairs at BH-FDR < 0.05:",
+    sum(lm_padj < 0.05, na.rm = TRUE), "\n")
+cat("NOTE: Batch 1 is all-progressor, so the case_control term is partially aliased",
+    "with batch and loses power - interpret case_control accordingly.\n")
+```
+
+
+# CHUNK 25: Module-trait heatmap
+```{r heatmap, fig.height = 9, fig.width = 11}
+sig_stars <- ifelse(moduleTraitPadj < 0.001, "***",
+              ifelse(moduleTraitPadj < 0.01,  "**",
+              ifelse(moduleTraitPadj < 0.05,  "*",
+              ifelse(moduleTraitPadj < 0.20,  "~", ""))))
+textMatrix <- matrix(paste0(signif(moduleTraitCor, 2), "\n", sig_stars),
+                     nrow = nrow(moduleTraitCor))
+par(mar = c(6, 9, 5, 3))
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = colnames(traitData), yLabels = names(mergedMEs_matched),
+               ySymbols = names(mergedMEs_matched), colorLabels = FALSE,
+               colors = blueWhiteRed(50), textMatrix = textMatrix,
+               setStdMargins = FALSE, cex.text = 0.45, zlim = c(-1, 1),
+               main = paste0("Module-Trait Relationships (n = ",
+                             length(common_samples), ")\n",
+                             "*** FDR<0.001  ** FDR<0.01  * FDR<0.05  ~ FDR<0.20"))
+```
+
+
+# CHUNK 26: Significant associations table
+```{r sig-table}
+# Significance is defined by the batch-adjusted lm (MR48); bicor kept side-by-side.
+sig_idx <- which(lm_padj < 0.05, arr.ind = TRUE)
+results_table <- data.frame(
+  Module    = rownames(lm_padj)[sig_idx[, 1]],
+  Trait     = colnames(lm_padj)[sig_idx[, 2]],
+  lm_coef   = round(lm_coef[sig_idx], 3),
+  lm_FDR    = signif(lm_padj[sig_idx], 3),
+  bicor_r   = round(moduleTraitCor[sig_idx], 3),
+  bicor_FDR = signif(moduleTraitPadj[sig_idx], 3))
+results_table <- results_table[!grepl("grey", results_table$Module, ignore.case = TRUE), ]
+results_table <- results_table[order(results_table$lm_FDR), ]
+rownames(results_table) <- NULL
+cat("Batch-adjusted significant module-trait pairs (lm FDR < 0.05):", nrow(results_table), "\n")
+print(results_table)
+write.csv(results_table, file.path(OUTDIR, "module_trait_significant.csv"),
+          row.names = FALSE)
+# full batch-adjusted FDR matrix for the record
+write.csv(data.frame(module = rownames(lm_padj), lm_padj, check.names = FALSE),
+          file.path(OUTDIR, "module_trait_lm_FDR_matrix.csv"), row.names = FALSE)
+```
+
+# CHUNK 26B: Direction-aware case_control module summary
+```{r}
+cc_idx <- which(colnames(moduleTraitCor) == "case_control")
+
+direction_summary <- data.frame(
+  module    = gsub("^ME", "", rownames(moduleTraitCor)),
+  bicor_r   = round(moduleTraitCor[, cc_idx], 3),
+  p_raw     = signif(moduleTraitPvalue[, cc_idx], 3),
+  FDR       = signif(moduleTraitPadj[, cc_idx], 3),
+  direction = ifelse(moduleTraitCor[, cc_idx] > 0,
+                     "UP in cases", "DOWN in cases"),
+  stringsAsFactors = FALSE)
+
+# Drop grey
+direction_summary <- direction_summary[direction_summary$module != "grey", ]
+direction_summary <- direction_summary[order(direction_summary$bicor_r), ]
+
+cat("\n--- All modules ranked by case_control direction ---\n")
+print(direction_summary)
+
+cat("\n--- Top 5 case-DOWN modules ---\n")
+print(head(direction_summary, 5))
+
+cat("\n--- Top 5 case-UP modules ---\n")
+print(tail(direction_summary, 5))
+
+write.csv(direction_summary,
+          file.path(OUTDIR, "module_case_direction_summary.csv"),
+          row.names = FALSE)
+
+# Exploratory: case-DOWN modules at relaxed FDR < 0.20
+exploratory_down <- direction_summary[
+  direction_summary$bicor_r < 0 & direction_summary$FDR < 0.20, ]
+
+cat("\n--- Exploratory case-DOWN modules (FDR < 0.20) ---\n")
+if (nrow(exploratory_down) > 0) {
+  print(exploratory_down)
+} else {
+  cat("None found.\n")
+}
+
+# Save for Discussion section
+write.csv(exploratory_down,
+          file.path(DIR_ENRICH, "case_down_exploratory_FDR020.csv"),
+          row.names = FALSE)
+```
+
+# CHUNK 27: Biotype composition  (margins fixed for inline rendering)
+```{r biotype-composition, fig.height = 7, fig.width = 14}
+biotype_lookup <- setNames(anno$gene_biotype, anno$ensembl_gene_id)
+gene_biotypes  <- biotype_lookup[colnames(expression.data)]
+biotype_grouped <- dplyr::case_when(
+  gene_biotypes == "lncRNA"         ~ "lncRNA",
+  gene_biotypes == "protein_coding" ~ "protein_coding",
+  is.na(gene_biotypes)              ~ NA_character_,
+  TRUE                              ~ "other_ncRNA")
+module_biotype_df <- data.frame(gene_id = names(mergedColors),
+                                module  = mergedColors,
+                                biotype = biotype_grouped) %>%
+  dplyr::filter(!is.na(biotype))
+module_counts <- as.data.frame(
+  table(module = module_biotype_df$module, biotype = module_biotype_df$biotype))
+module_wide <- reshape(module_counts, idvar = "module",
+                       timevar = "biotype", direction = "wide")
+colnames(module_wide) <- gsub("Freq\\.", "", colnames(module_wide))
+module_wide[is.na(module_wide)] <- 0
+if (!"other_ncRNA" %in% colnames(module_wide)) module_wide$other_ncRNA <- 0
+module_wide$mapped_total <- rowSums(module_wide[, c("lncRNA", "protein_coding")])
+module_wide$pct_lncRNA   <- round(100 * module_wide$lncRNA / module_wide$mapped_total, 1)
+module_wide$pct_coding   <- round(100 * module_wide$protein_coding / module_wide$mapped_total, 1)
+module_wide <- module_wide[order(-module_wide$pct_lncRNA), ]
+write.csv(module_wide, file.path(OUTDIR, "module_biotype_composition.csv"),
+          row.names = FALSE)
+
+plot_mat <- t(as.matrix(
+  module_wide[, c("lncRNA", "protein_coding")] / module_wide$mapped_total * 100))
+colnames(plot_mat) <- module_wide$module
+tryCatch({
+  par(mfrow = c(1, 1), mar = c(8, 4, 3, 2))   # reset layout: source() leaks par() between chunks
+  barplot(plot_mat, col = c("#E05C5C", "#5B8DB8"), border = NA, las = 2,
+          cex.names = 0.55, ylab = "% of mapped module genes", ylim = c(0, 100),
+          main = "Biotype Composition per WGCNA Module (sorted by lncRNA %)")
+  abline(h = 50, lty = 2, col = "black", lwd = 1.2)
+  legend("topright", legend = c("lncRNA", "protein_coding"),
+         fill = c("#E05C5C", "#5B8DB8"), border = NA, bty = "n")
+}, error = function(e) cat("biotype barplot skipped:", conditionMessage(e), "\n"))
+```
+
+
+# CHUNK 28: Module Membership + Gene Significance
+```{r gs-mm}
+modNames <- substring(names(mergedMEs), 3)
+MM_result <- bicorAndPvalue(expression.data, mergedMEs, use = "p")
+geneModuleMembership <- as.data.frame(MM_result$bicor)
+MMpvalue             <- as.data.frame(MM_result$p)
+names(geneModuleMembership) <- paste0("MM.",   modNames)
+names(MMpvalue)             <- paste0("p.MM.", modNames)
+GS_result <- bicorAndPvalue(expression.data, traitData, use = "p")
+geneTraitSignificance <- as.data.frame(GS_result$bicor)
+GSvalue               <- as.data.frame(GS_result$p)
+names(geneTraitSignificance) <- paste0("GS.",   names(traitData))
+names(GSvalue)               <- paste0("p.GS.", names(traitData))
+```
+
+
+# CHUNK 29: MM vs GS scatter (auto)
+```{r mm-gs-auto, fig.width = 6, fig.height = 5}
+if (nrow(results_table) > 0) {
+  par(mfrow = c(1, 1))   # reset layout: source() leaks par() between chunks
+  sig_pairs <- results_table[, c("Module", "Trait")]
+  sig_pairs$Module <- gsub("^ME", "", sig_pairs$Module)
+  sig_pairs <- sig_pairs[sig_pairs$Module %in% modNames, ]
+  sig_pairs <- sig_pairs[paste0("GS.", sig_pairs$Trait) %in%
+                         colnames(geneTraitSignificance), ]
+  for (i in seq_len(nrow(sig_pairs))) {
+    mod    <- sig_pairs$Module[i]
+    trait  <- sig_pairs$Trait[i]
+    column <- match(mod, modNames)
+    moduleGenes <- mergedColors == mod
+    if (is.na(column) || sum(moduleGenes) == 0) next
+    tryCatch(verboseScatterplot(
+      abs(geneModuleMembership[moduleGenes, column]),
+      abs(geneTraitSignificance[moduleGenes, paste0("GS.", trait)]),
+      xlab = paste("MM in", mod), ylab = paste("GS for", trait),
+      main = paste0("MM vs GS - ", mod, " x ", trait), col = mod),
+      error = function(e) cat("MM-GS scatter skipped:", conditionMessage(e), "\n"))
+  }
+}
+```
+
+
+# CHUNK 30: geneInfo table
+```{r gene-info}
+probes       <- colnames(expression.data)
+probes2annot <- match(probes, anno$ensembl_gene_id)
+geneInfo0 <- data.frame(
+  ensembl_id   = probes,
+  geneSymbol   = anno$hgnc_symbol[probes2annot],
+  gene_biotype = anno$gene_biotype[probes2annot],
+  moduleColor  = mergedColors,
+  geneTraitSignificance,
+  GSvalue,
+  stringsAsFactors = FALSE)
+modOrder <- order(-abs(cor(mergedMEs, traitData$case_control, use = "p")))
+for (k in seq_len(ncol(geneModuleMembership))) {
+  oldNames  <- names(geneInfo0)
+  geneInfo0 <- data.frame(geneInfo0,
+                          geneModuleMembership[, modOrder[k]],
+                          MMpvalue[, modOrder[k]])
+  names(geneInfo0) <- c(oldNames,
+                        paste0("MM.",   modNames[modOrder[k]]),
+                        paste0("p.MM.", modNames[modOrder[k]]))
+}
+geneOrder <- order(geneInfo0$moduleColor, -abs(geneInfo0$GS.case_control))
+geneInfo  <- geneInfo0[geneOrder, ]
+write.csv(geneInfo, file.path(OUTDIR, "geneInfo_full.csv"), row.names = FALSE)
+cat("geneInfo saved:", nrow(geneInfo), "rows ×", ncol(geneInfo), "columns\n")
+```
+
+
+# CHUNK 31: Top hub genes per significant module
+```{r hub-table}
+sig_modules <- unique(gsub("^ME", "", results_table$Module))
+sig_modules <- setdiff(sig_modules, "grey")
+for (mod in sig_modules) {
+  mm_col <- paste0("MM.", mod)
+  if (!mm_col %in% colnames(geneInfo)) next
+  cat("\n-- Module:", mod, "--\n")
+  sub <- geneInfo[geneInfo$moduleColor == mod, ]
+  sub <- sub[order(-abs(sub[[mm_col]])), ]
+  print(head(sub[, c("geneSymbol", "gene_biotype", mm_col,
+                     "GS.case_control", "GS.ER", "GS.grade")], 5))
+}
+```
+
+
+# CHUNK 32: Consolidated fgsea — single computation across 4 collections
+```{r fgsea-master}
+all_modules <- setdiff(unique(geneInfo$moduleColor), "grey")
+cat("Non-grey modules to test:", length(all_modules), "\n")
+
+load_collection <- function(coll, sub = NULL) {
+  args <- list(species = "Homo sapiens", collection = coll)
+  if (!is.null(sub)) args$subcollection <- sub
+  sets <- do.call(msigdbr, args)
+  split(sets$ensembl_gene, sets$gs_name)
+}
+collections <- list(
+  Hallmark      = load_collection("H"),
+  GO_BP         = load_collection("C5", "GO:BP"),
+  Reactome      = load_collection("C2", "CP:REACTOME"),
+  C1_positional = load_collection("C1"))
+for (n in names(collections))
+  cat(sprintf("  %-15s: %d gene sets\n", n, length(collections[[n]])))
+
+# Helper — runs fgsea on one module against one collection
+# scoreType = "pos" silences within-module MM-ranking warnings (all values > 0)
+run_fgsea_module <- function(mod, paths) {
+  mm_col <- paste0("MM.", mod)
+  if (!mm_col %in% colnames(geneInfo)) return(NULL)
+  mod_df <- geneInfo[geneInfo$moduleColor == mod, ]
+  mr <- setNames(mod_df[[mm_col]], mod_df$ensembl_id)
+  mr <- sort(mr[!is.na(mr)], decreasing = TRUE)
+  if (length(mr) < 10) return(NULL)
+  res <- suppressWarnings(tryCatch(
+    fgsea(pathways = paths, stats = mr,
+          minSize = 5, maxSize = 500, eps = 0,
+          scoreType = "std"),
+    error = function(e) NULL))
+  if (is.null(res) || nrow(res) == 0) return(NULL)
+  res$module <- mod
+  res
+}
+
+# Run all 4 × 38 combinations once and cache
+fgsea_all <- list()
+set.seed(42)
+for (coll_name in names(collections)) {
+  cat("\nRunning", coll_name, "...\n")
+  fgsea_all[[coll_name]] <- lapply(all_modules, run_fgsea_module,
+                                   paths = collections[[coll_name]])
+  names(fgsea_all[[coll_name]]) <- all_modules
+}
+saveRDS(fgsea_all, file.path(INTERMEDIATE, "fgsea_results_master_uncorrected.rds"))
+
+# Build long-format data frame with leadingEdge flattened to avoid CSV errors
+long_df <- do.call(rbind, lapply(names(fgsea_all), function(coll) {
+  do.call(rbind, lapply(all_modules, function(mod) {
+    r <- fgsea_all[[coll]][[mod]]
+    if (is.null(r) || nrow(r) == 0) return(NULL)
+    d <- as.data.frame(r)
+    d$collection  <- coll
+    d$leadingEdge <- sapply(d$leadingEdge, function(x) paste(x, collapse = ";"))
+    d
+  }))
+}))
+write.csv(long_df, file.path(DIR_ENRICH, "fgsea_all_results.csv"), row.names = FALSE)
+cat("\nAll fgsea results saved:", nrow(long_df), "rows\n")
+```
+
+# CHUNK 33: Master annotation table
+```{r fgsea-rescue-summary}
+hit_counts <- long_df %>%
+  dplyr::group_by(module, collection) %>%
+  dplyr::summarise(n_sig    = sum(padj < 0.05, na.rm = TRUE),
+                   n_tested = dplyr::n(), .groups = "drop")
+hit_wide <- hit_counts %>%
+  dplyr::select(module, collection, n_sig) %>%
+  tidyr::pivot_wider(names_from = collection, values_from = n_sig, values_fill = 0)
+
+mod_size <- geneInfo %>%
+  dplyr::filter(moduleColor != "grey") %>%
+  dplyr::group_by(moduleColor) %>%
+  dplyr::summarise(n_genes = dplyr::n(),
+                   pct_lncRNA = round(100 * sum(gene_biotype == "lncRNA") /
+                                        dplyr::n(), 1),
+                   .groups = "drop") %>%
+  dplyr::rename(module = moduleColor)
+
+trait_sig <- results_table %>%
+  dplyr::mutate(module = gsub("^ME", "", Module)) %>%
+  dplyr::group_by(module) %>%
+  dplyr::summarise(n_traits_sig = dplyr::n_distinct(Trait),
+                   significant_traits = paste(unique(Trait), collapse = ", "),
+                   .groups = "drop")
+
+master <- mod_size %>%
+  dplyr::left_join(trait_sig, by = "module") %>%
+  dplyr::left_join(hit_wide,  by = "module") %>%
+  dplyr::mutate(across(c(n_traits_sig, Hallmark, GO_BP, Reactome, C1_positional),
+                       ~ tidyr::replace_na(.x, 0)),
+                significant_traits = tidyr::replace_na(significant_traits, "—"))
+
+master <- master %>%
+  dplyr::mutate(rescued_by = dplyr::case_when(
+    Hallmark > 0      ~ "Hallmark",
+    GO_BP > 0         ~ "GO BP",
+    Reactome > 0      ~ "Reactome",
+    C1_positional > 0 ~ "C1 positional",
+    TRUE              ~ "None")) %>%
+  dplyr::mutate(scope = dplyr::case_when(
+    n_traits_sig > 0 & rescued_by != "None" ~ "Include: trait + biology",
+    n_traits_sig > 0                        ~ "Include: trait only",
+    rescued_by != "None"                    ~ "Include: biology only",
+    TRUE                                    ~ "Exclude: no trait, no biology")) %>%
+  dplyr::arrange(scope, dplyr::desc(n_genes))
+
+print(master)
+write.csv(master, file.path(OUTDIR, "master_annotation_table.csv"), row.names = FALSE)
+cat("\nScope counts:\n"); print(table(master$scope))
+```
+
+
+# CHUNK 34: Master annotation figure
+```{r master-figure, fig.height = 10, fig.width = 12}
+master_plot <- master
+master_plot$module     <- factor(master_plot$module,
+                                 levels = master_plot$module[order(master_plot$n_genes)])
+master_plot$rescued_by <- factor(master_plot$rescued_by,
+                                 levels = c("Hallmark","GO BP","Reactome",
+                                            "C1 positional","None"))
+p_master <- ggplot(master_plot, aes(x = module, y = n_genes, fill = rescued_by)) +
+  geom_col() +
+  geom_text(aes(label = ifelse(n_traits_sig > 0,
+                               paste0("★", n_traits_sig), "")),
+            hjust = -0.2, size = 3) +
+  scale_fill_manual(values = c("Hallmark"      = "#d73027",
+                               "GO BP"         = "#fc8d59",
+                               "Reactome"      = "#fdae61",
+                               "C1 positional" = "#fee090",
+                               "None"          = "grey75")) +
+  coord_flip() +
+  labs(title    = "Module annotation status across enrichment strategies",
+       subtitle = "Bar = module size; colour = first database providing significance; ★n = significant traits",
+       x = NULL, y = "Number of genes", fill = "Rescued by") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+print(p_master)
+ggsave(file.path(OUTDIR, "master_annotation_status.png"),
+       p_master, width = 12, height = 10, dpi = 200, bg = "white")
+```
+
+
+# CHUNK 35: All-modules Hallmark heatmap
+```{r hallmark-heatmap-all, fig.height = 12, fig.width = 14}
+hm <- long_df %>%
+  dplyr::filter(collection == "Hallmark") %>%
+  dplyr::mutate(pathway = gsub("^HALLMARK_", "", pathway))
+p_hm <- ggplot(hm, aes(x = module, y = pathway, fill = NES)) +
+  geom_tile(color = "grey90") +
+  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027",
+                       midpoint = 0, limits = c(-3, 3),
+                       oob = scales::squish, name = "NES") +
+  geom_text(aes(label = ifelse(padj < 0.05, "*", "")), size = 3, vjust = 0.7) +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title    = "Hallmark enrichment across all modules",
+       subtitle = "* = padj < 0.05",
+       x = NULL, y = NULL)
+print(p_hm)
+ggsave(file.path(OUTDIR, "hallmark_heatmap_all_modules.png"),
+       p_hm, width = 14, height = 12, dpi = 200, bg = "white")
+```
+
+
+# CHUNK 36: Per-module Hallmark barplots (significant only)
+```{r hallmark-barplots, fig.width = 8, fig.height = 5}
+hallmark_sig_mods <- master$module[master$Hallmark > 0]
+for (mod in as.character(hallmark_sig_mods)) {
+  d <- long_df %>%
+    dplyr::filter(collection == "Hallmark", module == mod, padj < 0.05)
+  if (nrow(d) == 0) next
+  d$pathway   <- gsub("^HALLMARK_", "", d$pathway)
+  d$direction <- ifelse(d$NES > 0, "Activated", "Suppressed")
+  p <- ggplot(d, aes(reorder(pathway, NES), NES, fill = direction)) +
+    geom_col() +
+    scale_fill_manual(values = c("Activated" = "#d73027", "Suppressed" = "#4575b4")) +
+    coord_flip() +
+    labs(title = paste("Hallmark —", mod), x = NULL, y = "NES", fill = NULL) +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom")
+  print(p)
+}
+```
+
+# CHUNK 36B Plots top 10 Hallmark pathways for every module that did NOT have
+# any padj < 0.05 hits — showing NES "for reference" so absence
+```{r hallmark-barplots-below-threshold, fig.width = 8, fig.height = 5}
+nonsig_hallmark_mods <- master$module[master$Hallmark == 0]
+
+for (mod in as.character(nonsig_hallmark_mods)) {
+  d <- long_df %>%
+    dplyr::filter(collection == "Hallmark", module == mod)
+  if (nrow(d) == 0) next
+  
+  # Top 10 by |NES| (no padj filter — by definition none pass)
+  d <- d %>%
+    dplyr::arrange(dplyr::desc(abs(NES))) %>%
+    dplyr::slice_head(n = 10)
+  d$pathway   <- gsub("^HALLMARK_", "", d$pathway)
+  d$direction <- ifelse(d$NES > 0, "Activated", "Suppressed")
+
+  p <- ggplot(d, aes(reorder(pathway, NES), NES, fill = direction)) +
+    geom_col(alpha = 0.7) +
+    scale_fill_manual(values = c("Activated"  = "#d73027",
+                                 "Suppressed" = "#4575b4")) +
+    coord_flip() +
+    labs(title    = paste("Hallmark —", mod, "(below threshold)"),
+         subtitle = "Top 10 by |NES|; no pathway reached padj < 0.05",
+         x = NULL, y = "Normalised Enrichment Score (NES)", fill = NULL) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom",
+          plot.subtitle   = element_text(face = "italic", colour = "grey40"))
+  print(p)
+}
+
+cat("\nPlotted", length(nonsig_hallmark_mods),
+    "below-threshold modules.\n")
+```
+
+# CHUNK 37: Rescue grid for GO BP / Reactome / C1 modules
+```{r rescue-plots, fig.width = 8, fig.height = 5}
+rescued_mods <- master %>%
+  dplyr::filter(rescued_by %in% c("GO BP","Reactome","C1 positional")) %>%
+  dplyr::arrange(rescued_by, module)
+
+for (i in seq_len(nrow(rescued_mods))) {
+  mod       <- as.character(rescued_mods$module[i])
+  best      <- as.character(rescued_mods$rescued_by[i])
+  best_coll <- gsub(" ", "_", best)
+
+  d <- long_df %>%
+    dplyr::filter(module == mod, collection == best_coll, padj < 0.05) %>%
+    dplyr::arrange(dplyr::desc(abs(NES))) %>%
+    dplyr::slice_head(n = 15)
+  if (nrow(d) == 0) next
+
+  d$pathway   <- tolower(gsub("_", " ",
+                              gsub("^(HALLMARK_|GOBP_|REACTOME_)", "", d$pathway)))
+  d$direction <- ifelse(d$NES > 0, "Activated", "Suppressed")
+
+  p <- ggplot(d, aes(reorder(pathway, NES), NES, fill = direction)) +
+    geom_col(alpha = 0.85) +
+    scale_fill_manual(values = c("Activated"  = "#d73027",
+                                 "Suppressed" = "#4575b4")) +
+    coord_flip() +
+    labs(title    = paste0(mod, " — ", best),
+         subtitle = sprintf("Top %d pathways with padj < 0.05", nrow(d)),
+         x = NULL, y = "Normalised Enrichment Score (NES)", fill = NULL) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom",
+          plot.title    = element_text(face = "bold"),
+          plot.subtitle = element_text(face = "italic", colour = "grey40"))
+  print(p)
+}
+
+cat("\nPlotted", nrow(rescued_mods), "rescued modules individually.\n")
+```
+
+# CHUNK 38: Cytoscape network export
+```{r cytoscape-export}
+mergedColors <- setNames(as.character(mergedColors), colnames(expression.data))
+sig_mods <- intersect(sig_modules, unique(mergedColors))
+sig_mods <- setdiff(sig_mods, "grey")
+probes       <- colnames(expression.data)
+probe_symbol <- anno$hgnc_symbol[match(probes, anno$ensembl_gene_id)]
+probe_symbol[is.na(probe_symbol) | probe_symbol == ""] <-
+  probes[is.na(probe_symbol) | probe_symbol == ""]
+nTop <- 30
+hub_summary <- data.frame()
+for (mod in sig_mods) {
+  inModule   <- mergedColors == mod
+  modProbes  <- probes[inModule]
+  modSymbols <- probe_symbol[inModule]
+  if (sum(inModule) == 0) next
+  modTOM <- TOM[inModule, inModule]
+  rownames(modTOM) <- colnames(modTOM) <- modSymbols
+  IMConn <- rowSums(modTOM) - 1
+  nSelect <- min(nTop, sum(inModule))
+  topIdx <- rank(-IMConn) <= nSelect
+  ord    <- order(-IMConn[topIdx])
+  exportNetworkToCytoscape(
+    modTOM[topIdx, topIdx],
+    edgeFile = file.path(OUTDIR, paste0("Cytoscape_edges_", mod, ".txt")),
+    nodeFile = file.path(OUTDIR, paste0("Cytoscape_nodes_", mod, ".txt")),
+    weighted = TRUE, threshold = 0.02,
+    nodeNames = modSymbols[topIdx][ord],
+    nodeAttr  = rep(mod, nSelect))
+  hub_summary <- rbind(hub_summary, data.frame(
+    module        = mod,
+    rank          = seq_len(nSelect),
+    gene_id       = modProbes[topIdx][ord],
+    gene_symbol   = modSymbols[topIdx][ord],
+    intramod_conn = round(IMConn[topIdx][ord], 4)))
+}
+write.csv(hub_summary, file.path(OUTDIR, "hub_summary.csv"), row.names = FALSE)
+cat("Cytoscape files exported for", length(sig_mods), "modules\n")
+```
+
+# CHUNK 39: DEG × WGCNA integration
+```{r deg-integration}
+DEG_PATH <- file.path(DIR_CCDEG, "allsamples_DEgenes.tsv")
+deg <- read.table(DEG_PATH, header = TRUE, sep = "\t",
+                  row.names = 1, stringsAsFactors = FALSE)
+common_ids <- intersect(rownames(deg), rownames(geneInfo))
+deg_mapped <- cbind(geneInfo[common_ids, ],
+                    deg[common_ids, c("log2FoldChange", "padj", "diffexpressed")])
+deg_mapped$own_MM <- sapply(seq_len(nrow(deg_mapped)), function(i) {
+  col <- paste0("MM.", deg_mapped$moduleColor[i])
+  if (col %in% colnames(deg_mapped)) deg_mapped[i, col] else NA_real_
+})
+print(table(deg_mapped$moduleColor, deg_mapped$diffexpressed))
+
+enrich_df <- do.call(rbind, lapply(
+  setdiff(unique(geneInfo$moduleColor), "grey"),
+  function(mod) {
+    n_mod <- sum(geneInfo$moduleColor == mod)
+    n_oth <- nrow(geneInfo) - n_mod
+    n_up <- sum(deg_mapped$moduleColor == mod & deg_mapped$diffexpressed == "UP",   na.rm = TRUE)
+    n_dn <- sum(deg_mapped$moduleColor == mod & deg_mapped$diffexpressed == "DOWN", na.rm = TRUE)
+    if (n_up + n_dn == 0) return(NULL)
+    total_up <- sum(deg_mapped$diffexpressed == "UP",   na.rm = TRUE)
+    total_dn <- sum(deg_mapped$diffexpressed == "DOWN", na.rm = TRUE)
+    p_up <- tryCatch(fisher.test(matrix(c(n_up, total_up - n_up,
+                                          n_mod - n_up, n_oth - (total_up - n_up)),
+                                        2, 2), alternative = "greater")$p.value,
+                     error = function(e) NA)
+    p_dn <- tryCatch(fisher.test(matrix(c(n_dn, total_dn - n_dn,
+                                          n_mod - n_dn, n_oth - (total_dn - n_dn)),
+                                        2, 2), alternative = "greater")$p.value,
+                     error = function(e) NA)
+    data.frame(module = mod, n_genes = n_mod, n_UP = n_up, n_DOWN = n_dn,
+               p_UP = p_up, p_DOWN = p_dn)
+  }))
+enrich_df$FDR_UP   <- p.adjust(enrich_df$p_UP,   method = "BH")
+enrich_df$FDR_DOWN <- p.adjust(enrich_df$p_DOWN, method = "BH")
+write.csv(enrich_df, file.path(DIR_ENRICH, "deg_module_enrichment.csv"), row.names = FALSE)
+```
+
+
+# CHUNK 40: MM vs GS scatter coloured by DEG
+```{r deg-scatter-auto, fig.width = 6, fig.height = 5}
+plot_MM_vs_GS <- function(mod, trait) {
+  mm_col <- paste0("MM.", mod); gs_col <- paste0("GS.", trait)
+  if (!all(c(mm_col, gs_col) %in% colnames(geneInfo))) return(invisible(NULL))
+  pd <- data.frame(
+    MM = geneInfo[[mm_col]], GS = geneInfo[[gs_col]],
+    sym = geneInfo$geneSymbol,
+    dir = ifelse(rownames(geneInfo) %in%
+                 rownames(deg_mapped[deg_mapped$diffexpressed == "UP", ]),   "UP",
+          ifelse(rownames(geneInfo) %in%
+                 rownames(deg_mapped[deg_mapped$diffexpressed == "DOWN", ]), "DOWN", "none")))
+  pd <- pd[geneInfo$moduleColor == mod & !is.na(pd$MM) & !is.na(pd$GS), ]
+  if (nrow(pd) == 0) return(invisible(NULL))
+  pd$label <- ifelse(pd$dir != "none", pd$sym,
+                     ifelse(rank(-abs(pd$MM)) <= 5, pd$sym, ""))
+  r <- round(cor(pd$MM, pd$GS, method = "spearman"), 3)
+  print(
+    ggplot(pd, aes(MM, GS)) +
+      geom_point(data = subset(pd, dir == "none"),
+                 colour = "grey70", size = 1, alpha = 0.4) +
+      geom_point(data = subset(pd, dir == "UP"),
+                 colour = "#C00000", size = 2.5, shape = 17) +
+      geom_point(data = subset(pd, dir == "DOWN"),
+                 colour = "#0070C0", size = 2.5, shape = 25) +
+      geom_smooth(method = "lm", se = TRUE,
+                  colour = "black", linewidth = 0.7, linetype = "dashed") +
+      geom_text_repel(aes(label = label), size = 3, max.overlaps = 20,
+                      colour = ifelse(pd$dir == "UP",   "#C00000",
+                               ifelse(pd$dir == "DOWN", "#0070C0", "grey40"))) +
+      labs(title    = paste0("ME", mod, " · MM vs GS.", trait),
+           subtitle = paste0("n=", nrow(pd),
+                             " | DEGs=", sum(pd$dir != "none"),
+                             " | Spearman r=", r),
+           x = mm_col, y = gs_col,
+           caption = "▲ UP-DEG  ▼ DOWN-DEG  ● background") +
+      theme_bw(base_size = 12) +
+      theme(plot.title = element_text(face = "bold")))
+}
+sig_pairs_scatter <- results_table[, c("Module", "Trait")]
+sig_pairs_scatter$Module <- gsub("^ME", "", sig_pairs_scatter$Module)
+sig_pairs_scatter <- sig_pairs_scatter[
+  sig_pairs_scatter$Module %in% modNames &
+  paste0("GS.", sig_pairs_scatter$Trait) %in% colnames(geneInfo), ]
+for (i in seq_len(nrow(sig_pairs_scatter))) {
+  plot_MM_vs_GS(sig_pairs_scatter$Module[i],
+                sig_pairs_scatter$Trait[i])
+}
+```
+
+
+# CHUNK 41: DEG volcano coloured by WGCNA module
+```{r volcano-by-module, fig.width = 9, fig.height = 7}
+deg_mapped %>%
+  mutate(nlp = -log10(padj),
+         label = case_when(
+           abs(own_MM) >= 0.75 & padj < 0.01           ~ geneSymbol,
+           -log10(padj) > 5                             ~ geneSymbol,
+           gene_biotype == "protein_coding" &
+             abs(log2FoldChange) > 1.5                 ~ geneSymbol,
+           TRUE                                         ~ "")) %>%
+  ggplot(aes(log2FoldChange, nlp, colour = moduleColor)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", colour = "grey50") +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 25,
+                  show.legend = FALSE) +
+  scale_colour_identity() +
+  labs(title = "DEG Volcano coloured by WGCNA module",
+       x = "log2FC ('left' control vs 'right' cases)", y = "-log10(padj)") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+# CHUNK 42: Save workspace
+```{r save-workspace}
+save(expression.data, mergedColors, mergedMEs, TOM,
+     geneInfo, results_table, sig_modules,
+     fgsea_all, long_df, master,
+     deg_mapped, enrich_df, hub_summary,
+     softPower, lm_coef, lm_padj, moduleTraitCor, moduleTraitPadj, batch_flag,
+     file = file.path(INTERMEDIATE, "WGCNA_uncorrected_workspace.RData"))
+cat("Workspace saved to", file.path(INTERMEDIATE, "WGCNA_uncorrected_workspace.RData"), "\n")
+cat("\n=== Files written to OUTDIR ===\n")
+print(list.files(OUTDIR))
+```

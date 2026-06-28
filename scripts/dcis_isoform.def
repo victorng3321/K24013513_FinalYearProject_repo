@@ -1,0 +1,13 @@
+Bootstrap: localimage
+From: /scratch/prj/ccc_dcis_ncrna/victor/data/bioconductor_3_19.sif
+
+%post
+    export MAKEFLAGS="-j4"
+    R -e 'options(Ncpus=4); BiocManager::install(c("IsoformSwitchAnalyzeR","satuRn","rtracklayer"), update=FALSE, ask=FALSE)'
+    R -e 'options(Ncpus=4); install.packages(c("ggraph","ggrepel","igraph","ggplot2","dplyr","gridExtra","scales"), repos="https://cloud.r-project.org")'
+    R -e 'stopifnot(requireNamespace("IsoformSwitchAnalyzeR"), requireNamespace("satuRn"), requireNamespace("ggraph")); cat(">>> BUILD OK\n")'
+
+%labels
+    Author Victor Ng
+    Pipeline DCIS isoform-switching (04) + network visualisation (05)
+    Base bioconductor RELEASE_3_19 / R 4.4.1
