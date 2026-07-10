@@ -1,8 +1,3 @@
-# DCIS Transcriptomics — MSc Applied Bioinformatics Final Year Project
-
-**Author:** Victor Ng (K24013513), King's College London
-**Cohort:** UK Sloane Project primary ductal carcinoma in situ (DCIS); Lips et al., 2022
-
 Analysis code and aggregate result tables for a transcriptomic study of primary DCIS,
 identifying co-expression network and isoform-usage features in the primary lesion that
 distinguish patients who subsequently develop an ipsilateral recurrence from those who do not.
