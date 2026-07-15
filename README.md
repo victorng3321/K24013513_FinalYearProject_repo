@@ -15,6 +15,7 @@ included in this repository. Only analysis code and aggregate, gene-level summar
   - `04b_isoform_switch_QC98.Rmd` — isoform switching (satuRn), 98 QC-passing samples
   - `04c_qc98_compare.R`, `04e_candidate_switchplots.R` — isoform helpers / candidate switch plots
   - `05_network_visualisation_HPC.R` — co-expression network figures
+  - `06_hub_gene_barplots.R` — hub-gene bar plots (Figure 3.6)
   - `config.R` — paths and helper functions
   - `run_in_container.sh`, `run_01b.sh`, `dcis_isoform.def` — run wrappers and container definition
 - `results/` — aggregate result tables (WGCNA, uncorrected-WGCNA sensitivity, enrichment, QC-98 isoform, paired and case/control DEGs)
