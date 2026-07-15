@@ -1,8 +1,6 @@
 # 04e_candidate_switchplots.R
 # Switch plots for the 4 pre-registered candidate genes (ESR1, PGR, ERBB2, AR)
-# from the QC-98 analysed object. Rebuilt from switchPlot's component panels so
-# the wasted right-hand legend column is removed and the lower panels fill the
-# frame. Falls back to the standard switchPlot() if the custom layout errors.
+
 source("config.R")
 suppressMessages({
   library(IsoformSwitchAnalyzeR); library(ggplot2)
