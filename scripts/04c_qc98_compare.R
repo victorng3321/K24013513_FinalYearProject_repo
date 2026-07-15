@@ -1,7 +1,3 @@
-# 04c_qc98_compare.R
-# Fast QC-98 isoform sensitivity check: reads the satuRn object already saved by
-# 04b (CHUNK 9) and reports isoform-level significant switches + replication of
-# the 7 primary (154-sample) switches. No re-run of the full pipeline needed.
 source("config.R")
 
 OUT_DIR <- file.path(RESULTS, "isoform_qc98")
