@@ -1,0 +1,7 @@
+# Table 3.3 — Candidate-gene transcript usage, 98 QC-passing cohort (satuRn).
+# 0 significant isoform switches genome-wide (q<0.05, |dIF|>=0.10; 160,780 isoforms / 15,964 genes).
+gene,receptor,n_isoforms_tested,max_abs_dIF,min_switch_q,significant
+ESR1,ER,10,0.08,~1.0,no
+PGR,PR,6,0.03,~1.0,no
+ERBB2,HER2,18,0.03,~1.0,no
+AR,AR,7,0.02,~1.0,no
