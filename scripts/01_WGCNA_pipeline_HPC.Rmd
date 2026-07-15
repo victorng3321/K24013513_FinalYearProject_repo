@@ -1,7 +1,7 @@
 
 ```{r}
-knitr::opts_chunk$set(dev = "png", dpi = 300, fig.path = file.path(DIR_WGCNA, "figures/"))
 source("config.R")
+knitr::opts_chunk$set(dev = "png", dpi = 300, fig.path = file.path(DIR_WGCNA, "figures/"))
 ```
 
 # CHUNK 1: Libraries
