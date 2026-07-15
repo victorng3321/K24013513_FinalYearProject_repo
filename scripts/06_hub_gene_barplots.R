@@ -1,13 +1,6 @@
-# =============================================================================
 # 06_hub_gene_barplots.R
-# Hub-gene bar plots for the recurrence-associated WGCNA modules (Figure 3.6).
-# Genes are ranked by intramodular connectivity (kIN = kWithin; Langfelder &
-# Horvath, 2008). One plot per module, coloured by the module's WGCNA colour;
-# a marker at each bar tip encodes biotype (circle = protein-coding, square = lncRNA).
-#
 # INPUT   <DIR_WGCNA>/hub_summary.csv, <DIR_WGCNA>/geneInfo_full.csv
 # OUTPUT  <DIR_WGCNA>/hub_plots/hub_<module>.{pdf,png} + hub_recurrence_stacked.{pdf,png}
-# =============================================================================
 
 source("config.R")
 library(readr); library(dplyr); library(ggplot2); library(forcats); library(patchwork)
