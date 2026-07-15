@@ -562,6 +562,60 @@ long_df <- do.call(rbind, lapply(names(fgsea_all), function(coll) {
 write.csv(long_df, file.path(DIR_ENRICH, "fgsea_all_results.csv"), row.names = FALSE)
 cat("\nAll fgsea results saved:", nrow(long_df), "rows\n")
 ```
+# CHUNK 32a: Hallmark enrichment bubble heatmap across all modules
+```{r hallmark-bubble, fig.width = 11, fig.height = 9}
+hm <- subset(long_df, collection == "Hallmark")
+hm$pathway <- gsub("^HALLMARK_", "", hm$pathway)
+keep <- unique(hm$pathway[hm$padj < 0.05])          # pathways significant in >=1 module
+hm <- hm[hm$pathway %in% keep, ]
+p_bubble <- ggplot(hm, aes(x = module, y = pathway, size = -log10(padj), colour = NES)) +
+  geom_point(alpha = 0.9) +
+  scale_colour_gradient2(low = "blue", mid = "grey90", high = "red", midpoint = 0) +
+  scale_size_continuous(range = c(0.5, 6), name = expression(-log[10]~padj)) +
+  labs(x = NULL, y = NULL, title = "MSigDB Hallmark enrichment across WGCNA modules") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+        axis.text.y = element_text(size = 7))
+ggsave(file.path(DIR_ENRICH, "hallmark_bubble_heatmap.png"), p_bubble,
+       width = 11, height = 9, dpi = 300)
+```
+
+# CHUNK 32b: Enrichment dotplot for the three recurrence-associated modules
+```{r recurrence-dotplot, fig.width = 9, fig.height = 8}
+recurrence_modules <- c("paleturquoise", "violet", "darkorange")
+enr <- subset(long_df, module %in% recurrence_modules & padj < 0.05)
+enr$term <- gsub("^(HALLMARK|GOBP|REACTOME)_", "", enr$pathway)
+enr <- enr[order(enr$module, enr$padj), ]
+top_terms <- do.call(rbind, by(enr, enr$module, function(d) head(d, 8)))
+top_terms$module <- factor(top_terms$module, levels = recurrence_modules)
+top_terms$term   <- factor(top_terms$term, levels = unique(top_terms$term[order(top_terms$NES)]))
+p_dot <- ggplot(top_terms, aes(x = module, y = term, size = size, colour = -log10(padj))) +
+  geom_point() +
+  scale_colour_viridis_c(option = "C", name = expression(-log[10]~padj)) +
+  scale_size_continuous(range = c(1, 7), name = "gene-set size") +
+  labs(x = NULL, y = NULL, title = "Enrichment in recurrence-associated modules") +
+  theme_bw() + theme(axis.text.y = element_text(size = 7))
+ggsave(file.path(DIR_ENRICH, "enrichment_dotplot_CCmodules.png"), p_dot,
+       width = 9, height = 8, dpi = 300)
+```
+
+# CHUNK 32c: GSEA running-enrichment ("mountain") plots for the recurrence modules
+```{r gsea-mountain, fig.width = 6, fig.height = 4}
+recurrence_modules <- c("darkorange", "paleturquoise", "violet")
+for (mod in recurrence_modules) {
+  mm_col <- paste0("MM.", mod)
+  md <- geneInfo[geneInfo$moduleColor == mod, ]
+  mr <- sort(setNames(md[[mm_col]], md$ensembl_id)[!is.na(md[[mm_col]])], decreasing = TRUE)
+  top <- subset(long_df, collection == "Hallmark" & module == mod)
+  top <- top[order(top$padj, top$pval), ][1, ]
+  p <- fgsea::plotEnrichment(collections$Hallmark[[top$pathway]], mr) +
+       ggplot2::labs(title = paste0(mod, " — ", top$pathway),
+                     subtitle = sprintf("NES = %.2f, padj = %.2g", top$NES, top$padj))
+  ggsave(file.path(DIR_ENRICH, paste0("gsea_mountain_", mod, ".png")), p,
+         width = 6, height = 4, dpi = 300)
+}
+```
+
 
 # CHUNK 33: Master annotation table
 ```{r fgsea-rescue-summary}
