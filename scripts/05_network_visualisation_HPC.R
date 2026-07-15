@@ -6,29 +6,26 @@ source("config.R")
 #(biotype = shape, kIN = colour + size)
 
 
-suppressMessages({
-  library(igraph); library(ggraph); library(ggrepel); library(scales); library(ggplot2)
-})
+library(igraph); library(ggraph); library(ggrepel); library(scales); library(ggplot2)
+
 
 
 ######################## 1. PARAMETERS #######################
 IN_DIR <- DIR_WGCNA
 OUT_DIR <- DIR_NETFIG
 
-MODULES <- "all"                  # "all", or c("paleturquoise","violet","darkorange")
+MODULES <- "all"                 
 
-TARGET_MEAN_DEGREE <- 8           # edge density; higher = more compact. 6-10 sensible.
+TARGET_MEAN_DEGREE <- 8          
 RESCUE_ISOLATES    <- TRUE
 
-KIN_LOW  <- "#DEEBF7"             # lowest kIN  (light blue)
-KIN_HIGH <- "#084594"            # highest kIN (dark blue)
-# (For stronger hub pop: KIN_LOW="#4575B4", KIN_HIGH="#D73027".)
+KIN_LOW  <- "#DEEBF7"             
+KIN_HIGH <- "#084594"            
 
-SIZE_RANGE   <- c(3, 12)          # node size across kIN
-NODE_BORDER  <- "grey25"          # uniform node outline
+SIZE_RANGE   <- c(3, 12)          
+NODE_BORDER  <- "grey25"          
 BORDER_STROKE<- 0.5
 
-# biotype -> shape (fillable shapes so the kIN gradient still applies)
 SHAPE_VALUES <- c(protein_coding = 21, lncRNA = 22)   # 21 circle, 22 square
 
 SKIP_ENSG_LABELS <- TRUE          # don't print unnamed ENSG... loci
@@ -39,7 +36,6 @@ PDF_W <- 9; PDF_H <- 8; PNG_DPI <- 300
 SEED  <- 42
 
 
-######################## 2. HELPERS #######################
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 prune_to_degree <- function(edges, node_ids, target_degree, rescue) {
