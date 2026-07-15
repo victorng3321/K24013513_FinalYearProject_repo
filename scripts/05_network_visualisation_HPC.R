@@ -37,6 +37,10 @@ SEED  <- 42
 
 
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+hub_sum     <- read.csv(file.path(IN_DIR, "hub_summary.csv"),   stringsAsFactors = FALSE)
+gene_info   <- read.csv(file.path(IN_DIR, "geneInfo_full.csv"), stringsAsFactors = FALSE)
+biotype_map <- setNames(ifelse(gene_info$gene_biotype == "lncRNA", "lncRNA", "protein_coding"),
+                        gene_info$geneSymbol)
 
 prune_to_degree <- function(edges, node_ids, target_degree, rescue) {
   n <- length(node_ids); k <- max(1, round(n * target_degree / 2))
@@ -65,8 +69,13 @@ render_module <- function(mod) {
   names(edges)[names(edges) == "toNode"]   <- "to"
   edges$weight <- as.numeric(edges$weight)
   names(nodes)[names(nodes) == "nodeName"] <- "name"
-  nodes$kIN <- as.numeric(nodes$kIN)
-  if (!"biotype" %in% names(nodes)) nodes$biotype <- "protein_coding"
+  kin_lookup <- setNames(hub_sum$intramod_conn[hub_sum$module == mod],
+                         hub_sum$gene_symbol[hub_sum$module == mod])
+  nodes$kIN  <- as.numeric(kin_lookup[nodes$name])
+  if (all(is.na(nodes$kIN))) nodes$kIN <- 1
+  nodes$kIN[is.na(nodes$kIN)] <- min(nodes$kIN, na.rm = TRUE)
+  nodes$biotype <- biotype_map[nodes$name]
+  nodes$biotype[is.na(nodes$biotype)] <- "protein_coding"
   if (nrow(nodes) < 2 || nrow(edges) < 1) { cat("  [skip]", mod, "- too small\n"); return(invisible()) }
   
   edges <- prune_to_degree(edges, nodes$name, TARGET_MEAN_DEGREE, RESCUE_ISOLATES)
